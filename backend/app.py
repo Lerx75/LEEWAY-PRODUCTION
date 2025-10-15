@@ -27,6 +27,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from health import router as health_router
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 from project_store import build_store_from_env
 from requests.adapters import HTTPAdapter
@@ -57,7 +58,7 @@ try:
 except Exception as exc:
     raise RuntimeError(f"Failed to initialise Google Maps client: {exc}") from exc
 
-_cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
+_cors_origins_env = os.getenv("ALLOWED_ORIGINS") or os.getenv("CORS_ALLOW_ORIGINS", "*")
 _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
 if not _cors_origins:
     _cors_origins = ["*"]
@@ -72,6 +73,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Health endpoint
+app.include_router(health_router)
 
 logger = logging.getLogger("leeway.api")
 
