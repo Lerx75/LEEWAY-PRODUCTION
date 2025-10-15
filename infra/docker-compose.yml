@@ -1,0 +1,94 @@
+version: '3.9'
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - leeway_net
+
+  frontend:
+    image: node:20-bullseye-slim
+    working_dir: /app
+    env_file:
+      - ./leeway-frontend/.env.production
+    volumes:
+      - ./leeway-frontend:/app
+      - frontend_node_modules:/app/node_modules
+      - frontend_auth_data:/app/data
+    environment:
+      NODE_ENV: production
+      AUTH_DB_PATH: /app/data/auth.db
+      NPM_CONFIG_PRODUCTION: "false"
+    command: sh -c "npm ci && npm run build && npm start"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - leeway_net
+
+  backend:
+    build:
+      context: ./backend
+    working_dir: /srv
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ./backend/.env.production
+    environment:
+      PYTHONUNBUFFERED: '1'
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      VRP_JOB_DIR: /srv/data/vrp-jobs
+      PYTHONPATH: /srv
+    volumes:
+      - ./backend:/srv
+      - backend_data:/srv/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2"
+    expose:
+      - "8000"
+    depends_on:
+      - redis
+    networks:
+      - leeway_net
+
+  worker:
+    build:
+      context: ./backend
+    working_dir: /srv
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ./backend/.env.production
+    environment:
+      PYTHONUNBUFFERED: '1'
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      VRP_JOB_DIR: /srv/data/vrp-jobs
+      PYTHONPATH: /srv
+    volumes:
+      - ./backend:/srv
+      - backend_data:/srv/data
+    command: >-
+      sh -c "pip install --no-cache-dir -r requirements.txt && python -m celery -A celery_app worker --loglevel=info"
+    depends_on:
+      - redis
+    networks:
+      - leeway_net
+
+networks:
+  leeway_net:
+    driver: bridge
+
+volumes:
+  frontend_node_modules:
+  frontend_auth_data:
+  backend_data:
+  redis_data:

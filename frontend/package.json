@@ -1,0 +1,41 @@
+{
+  "name": "leeway-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@clerk/nextjs": "^6.33.1",
+    "@prisma/client": "^5.0.0",
+    "@react-google-maps/api": "^2.20.7",
+    "bcrypt": "^5.1.0",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^9.4.0",
+    "h3-js": "^4.3.0",
+    "latest": "^0.2.0",
+    "leaflet": "^1.9.4",
+    "nanoid": "^5.0.7",
+    "next": "^14.2.33",
+    "openai": "^4.104.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "react-icons": "^5.5.0",
+    "react-leaflet": "^4.2.1",
+    "resend": "^4.0.0",
+    "sharp": "^0.33.3",
+    "stripe": "^14.25.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.20",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "prisma": "^5.0.0",
+    "typescript": "^5"
+  }
+}

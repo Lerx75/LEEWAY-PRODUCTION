@@ -1,0 +1,28 @@
+# Multi-stage production build for Next.js frontend
+FROM node:20-alpine AS deps
+WORKDIR /app
+# Copy only package manifests first (avoid copying root minimal package.json)
+COPY leeway-frontend/package*.json ./
+# Install full deps (dev needed for TypeScript/Tailwind build). We'll rely on Next.js standalone output to prune at runtime.
+RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+
+FROM node:20-alpine AS build
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY leeway-frontend .
+# Build (Next.js standalone output configured in next.config.ts)
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000
+# Copy only necessary build artifacts (standalone + public + .next/cache optional)
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+COPY --from=build /app/public ./public
+# If Next.js output: 'standalone', the server.js and required node_modules are inside .next/standalone
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://localhost:3000 || exit 1
+CMD ["node","server.js"]

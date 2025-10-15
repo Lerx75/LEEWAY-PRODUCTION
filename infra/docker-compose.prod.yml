@@ -1,0 +1,78 @@
+﻿services:
+  redis:
+    image: redis:7-alpine
+    container_name: leeway-redis
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: leeway-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - backend/.env.production
+    environment:
+      - CELERY_BROKER_URL=redis://leeway-redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://leeway-redis:6379/0
+      - VRP_JOB_DIR=/srv/data/vrp-jobs
+      - PYTHONPATH=/srv
+    volumes:
+      - backend_data:/srv/data
+    depends_on:
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; urllib.request.urlopen('http://127.0.0.1:8000/healthz'); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: leeway-worker
+    depends_on:
+      - redis
+    env_file:
+      - backend/.env.production
+    environment:
+      - CELERY_BROKER_URL=redis://leeway-redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://leeway-redis:6379/0
+      - VRP_JOB_DIR=/srv/data/vrp-jobs
+      - PYTHONPATH=/srv
+    volumes:
+      - backend_data:/srv/data
+    command: >-
+      python -m celery -A celery_app worker --loglevel=info
+
+  frontend:
+    build:
+      context: leeway-frontend
+      dockerfile: Dockerfile
+    container_name: leeway-frontend
+    env_file:
+      - leeway-frontend/.env.production
+    environment:
+      # Fallback / overrides; core vars (AUTH_SECRET, NEXTAUTH_URL, etc.) come from env_file
+      # IMPORTANT: Use the public API origin for browser requests in production
+      - NEXT_PUBLIC_API_URL=https://api.leewayroute.com
+      - AUTH_DB_PATH=/app/data/auth.db
+      # Build fingerprint surfaced by /api/version (optional but helps verify live deploy)
+      - BUILD_STAMP=prod-guest-auth-v2
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - frontend_auth_data:/app/data
+
+volumes:
+  backend_data:
+  frontend_auth_data:
+  redis_data:
