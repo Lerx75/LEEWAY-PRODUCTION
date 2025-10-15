@@ -1,0 +1,56 @@
+version: "3.9"
+name: leeway-dev
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: leeway-redis
+    ports:
+      - "6379:6379"
+
+  backend:
+    image: python:3.11-slim
+    container_name: leeway-backend
+    working_dir: /app
+    volumes:
+      - ../backend:/app
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000"
+    env_file:
+      - ./../infra/.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.connect(('127.0.0.1',8000)); print('ok')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: python:3.11-slim
+    container_name: leeway-worker
+    working_dir: /app
+    volumes:
+      - ../backend:/app
+    # NOTE: replace 'backend.celery_app:app' with the actual Celery app path you detect
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python -m celery -A backend.celery_app:app worker -l info"
+    env_file:
+      - ./../infra/.env
+    depends_on:
+      - redis
+      - backend
+
+  frontend:
+    image: node:20-bullseye-slim
+    container_name: leeway-frontend
+    working_dir: /web
+    volumes:
+      - ../frontend:/web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_TELEMETRY_DISABLED=1
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      - backend
