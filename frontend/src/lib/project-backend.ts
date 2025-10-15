@@ -19,6 +19,7 @@ const PUBLIC_USER: ProjectUser = {
 
 const resolveBase = () => {
   const candidates = [
+    process.env.NEXT_PUBLIC_API_BASE,
     process.env.PROJECT_BACKEND_URL,
     process.env.API_BASE_URL,
     process.env.BACKEND_API_URL,

@@ -154,3 +154,4 @@ frontend/.next/
 frontend/.turbo/
 frontend/dist/
 frontend/build/
+opt/
