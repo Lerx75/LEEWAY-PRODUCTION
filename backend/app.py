@@ -48,6 +48,15 @@ except Exception:  # pragma: no cover - allow start without OR-Tools for tooling
     routing_enums_pb2 = None  # type: ignore
     _HAS_ORTOOLS = False
 
+try:
+    from ortools.graph import pywrapgraph  # type: ignore
+    _mcf_mod = pywrapgraph
+    _HAS_FLOW = True
+except Exception:  # pragma: no cover - optional dependency
+    pywrapgraph = None  # type: ignore
+    _mcf_mod = None
+    _HAS_FLOW = False
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 GOOGLE_QPS = float(os.getenv("GOOGLE_QPS", "5"))
 GOOGLE_TIMEOUT = float(os.getenv("GOOGLE_TIMEOUT", "10"))
@@ -88,13 +97,21 @@ app.include_router(health_router)
 logger = logging.getLogger("leeway.api")
 
 # Try new OR-Tools API first, then legacy
-_HAS_FLOW = False
-_mcf_mod = None
 _UPLOAD_FILE_TYPES = (UploadFile, StarletteUploadFile)
 
 _PROJECT_SERVICE_TOKEN = os.getenv("PROJECT_SERVICE_TOKEN", "").strip()
 _PROJECT_STORE = None
 _PROJECT_STORE_ERROR_LOGGED = False
+
+
+def _new_mcf():
+    if not _HAS_FLOW or _mcf_mod is None:
+        raise RuntimeError("Min-cost flow not available on this server")
+    if hasattr(_mcf_mod, "SimpleMinCostFlow"):
+        return _mcf_mod.SimpleMinCostFlow()
+    if hasattr(_mcf_mod, "simple_min_cost_flow"):
+        return _mcf_mod.simple_min_cost_flow()
+    raise RuntimeError("Min-cost flow API unavailable")
 
 
 def _get_project_store():
@@ -391,6 +408,11 @@ CLUSTER_DEFAULT_SERVICE_MIN = float(os.getenv("CLUSTER_DEFAULT_SERVICE_MIN", "45
 CLUSTER_SOLVER_TIME_SEC = int(os.getenv("CLUSTER_SOLVER_TIME_SEC", "20"))
 CLUSTER_BASE_DAY_MINUTES = float(os.getenv("CLUSTER_BASE_DAY_MINUTES", "240"))
 CLUSTER_DURATION_PENALTY = float(os.getenv("CLUSTER_DURATION_PENALTY", "12.0"))
+CLUSTER_SA_POLISH = int(os.getenv("CLUSTER_SA_POLISH", "1"))
+CLUSTER_SA_MAX_N = int(os.getenv("CLUSTER_SA_MAX_N", "180"))
+CLUSTER_SA_ITERS = int(os.getenv("CLUSTER_SA_ITERS", "400"))
+CLUSTER_SA_INIT_TEMP = float(os.getenv("CLUSTER_SA_INIT_TEMP", "60"))
+CLUSTER_SA_COOLING = float(os.getenv("CLUSTER_SA_COOLING", "0.995"))
 
 _OSRM_BASE_RAW = (
     os.getenv("OSRM_BASE")
@@ -1361,6 +1383,135 @@ def _cluster_days_vrp(
         "service_minutes": service_minutes,
         "target_day_minutes": target_minutes,
     }
+
+
+def _sa_polish_day_routes(
+    routes: List[List[int]],
+    duration_matrix: np.ndarray,
+    service_seconds: np.ndarray,
+    target_minutes: float,
+    min_calls: int,
+    max_calls: int,
+    iterations: int,
+    init_temp: float,
+    cooling: float,
+) -> List[List[int]]:
+    if not routes or len(routes) < 2 or iterations <= 0 or init_temp <= 0 or cooling <= 0:
+        return routes
+    depot_idx = duration_matrix.shape[0] - 1
+    svc_minutes = [float(v) / 60.0 for v in service_seconds.tolist()]
+
+    def route_travel_minutes(nodes: List[int]) -> float:
+        if not nodes:
+            return 0.0
+        unvisited = list(nodes)
+        travel = 0.0
+        current = depot_idx
+        local_nodes = unvisited[:]
+        while local_nodes:
+            nxt = min(local_nodes, key=lambda idx: duration_matrix[current, idx])
+            travel += duration_matrix[current, nxt]
+            current = nxt
+            local_nodes.remove(nxt)
+        travel += duration_matrix[current, depot_idx]
+        return travel / 60.0
+
+    def routes_cost(solution: List[List[int]]) -> float:
+        total = 0.0
+        for day_nodes in solution:
+            if not day_nodes:
+                continue
+            travel = route_travel_minutes(day_nodes)
+            service = sum(svc_minutes[i] for i in day_nodes)
+            over = max(0.0, service - target_minutes)
+            total += travel + (over * over * CLUSTER_DURATION_PENALTY)
+        return total
+
+    def valid_move(src_len: int, dst_len: int) -> bool:
+        if max_calls > 0 and dst_len + 1 > max_calls:
+            return False
+        if min_calls > 0 and src_len - 1 < min_calls:
+            return False
+        return True
+
+    current = [sorted(day) for day in routes]
+    best = [day[:] for day in current]
+    current_cost = routes_cost(current)
+    best_cost = current_cost
+    temp = float(init_temp)
+
+    for step in range(int(iterations)):
+        if temp < 1e-3:
+            break
+        new_solution: Optional[List[List[int]]] = None
+        for _ in range(12):
+            if len(current) < 2:
+                break
+            kind = random.random()
+            cand = [day[:] for day in current]
+            if kind < 0.6:
+                src_idx = random.randrange(len(cand))
+                dst_idx = random.randrange(len(cand))
+                if src_idx == dst_idx:
+                    continue
+                src = cand[src_idx]
+                dst = cand[dst_idx]
+                if not src:
+                    continue
+                if not valid_move(len(src), len(dst)):
+                    continue
+                node = random.choice(src)
+                src.remove(node)
+                dst.append(node)
+                dst.sort()
+                cand[src_idx] = src
+                cand[dst_idx] = dst
+                new_solution = cand
+                break
+            else:
+                a_idx = random.randrange(len(cand))
+                b_idx = random.randrange(len(cand))
+                if a_idx == b_idx:
+                    continue
+                a = cand[a_idx]
+                b = cand[b_idx]
+                if not a or not b:
+                    continue
+                node_a = random.choice(a)
+                node_b = random.choice(b)
+                if min_calls > 0 and (len(a) < min_calls or len(b) < min_calls):
+                    continue
+                a[a.index(node_a)] = node_b
+                b[b.index(node_b)] = node_a
+                a.sort()
+                b.sort()
+                cand[a_idx] = a
+                cand[b_idx] = b
+                new_solution = cand
+                break
+        if new_solution is None:
+            temp *= cooling
+            continue
+        neighbor_cost = routes_cost(new_solution)
+        delta = neighbor_cost - current_cost
+        accept = False
+        if delta < 0:
+            accept = True
+        else:
+            try:
+                prob = math.exp(-delta / max(temp, 1e-6))
+            except Exception:
+                prob = 0.0
+            if random.random() < prob:
+                accept = True
+        if accept:
+            current = [day[:] for day in new_solution]
+            current_cost = neighbor_cost
+            if neighbor_cost + 1e-6 < best_cost:
+                best = [day[:] for day in new_solution]
+                best_cost = neighbor_cost
+        temp *= cooling
+    return best
 
 
 # ----------------------------
@@ -2811,11 +2962,10 @@ async def cluster_only(
     geo["Day"] = ""
 
     solver_limit = int(dayTimeLimitSec or CLUSTER_SOLVER_TIME_SEC)
-    solver_counts = {"ortools": 0, "fallback": 0}
-    drive_minutes_acc: List[float] = []
-    service_minutes_acc: List[float] = []
+    solver_counts = {"ortools": 0, "fallback": 0, "sa": 0}
     target_minutes_acc: List[float] = []
     fallback_notes: List[str] = []
+    sa_polished_groups = 0
 
     def _choose_depot(points: np.ndarray) -> Tuple[float, float]:
         if len(points) == 0:
@@ -2832,7 +2982,7 @@ async def cluster_only(
         return (float(np.mean(points[:, 0])), float(np.mean(points[:, 1])))
 
     def _cluster_indices(idxs: np.ndarray, note_key: str) -> None:
-        nonlocal solver_counts
+        nonlocal solver_counts, sa_polished_groups
         if len(idxs) == 0:
             return
         terr_coords = coords[idxs]
@@ -2840,18 +2990,24 @@ async def cluster_only(
         depot_lat_lng = _choose_depot(terr_coords)
         target_minutes = _estimate_target_minutes(svc_local, maxCalls)
         target_minutes_acc.append(float(target_minutes))
+        duration_matrix: Optional[np.ndarray] = None
+        combined_coords = np.vstack([terr_coords, np.array([depot_lat_lng])])
+        if CLUSTER_SA_POLISH and len(terr_coords) <= CLUSTER_SA_MAX_N:
+            try:
+                duration_matrix = osrm_table_batch_duration(combined_coords)
+            except Exception as exc:
+                fallback_notes.append(f"{note_key}: SA duration fallback ({exc})")
+                duration_matrix = None
+            if duration_matrix is None:
+                dist_mat = _haversine_matrix_full(combined_coords)
+                speed = max(OSRM_FALLBACK_SPEED_MPS, 0.1)
+                duration_matrix = dist_mat / speed
         routes: List[List[int]]
-        stats: Optional[Dict[str, Any]] = None
         if len(terr_coords) == 1:
             routes = [[0]]
-            stats = {
-                "drive_minutes": [0.0],
-                "service_minutes": [round(float(svc_local[0]) / 60.0, 3)],
-                "target_day_minutes": target_minutes,
-            }
         elif len(terr_coords) <= CLUSTER_OSRM_MAX_N:
             try:
-                routes, stats = _cluster_days_vrp(
+                routes, _ = _cluster_days_vrp(
                     terr_coords,
                     svc_local,
                     depot_lat_lng,
@@ -2870,6 +3026,28 @@ async def cluster_only(
             fallback_notes.append(f"{note_key}: skipped OR-Tools (size>{CLUSTER_OSRM_MAX_N})")
             routes = cvrp_days_for_territory(terr_coords, depot_lat_lng, minCalls, maxCalls)
 
+        if (
+            CLUSTER_SA_POLISH
+            and len(routes) > 1
+            and len(terr_coords) <= CLUSTER_SA_MAX_N
+            and duration_matrix is not None
+        ):
+            polished = _sa_polish_day_routes(
+                routes,
+                duration_matrix,
+                svc_local,
+                float(target_minutes),
+                int(minCalls),
+                int(maxCalls),
+                int(CLUSTER_SA_ITERS),
+                float(CLUSTER_SA_INIT_TEMP),
+                float(CLUSTER_SA_COOLING),
+            )
+            if polished:
+                routes = polished
+                solver_counts["sa"] += 1
+                sa_polished_groups += 1
+
         day_counter = 1
         for rel_route in routes:
             if not rel_route:
@@ -2877,10 +3055,6 @@ async def cluster_only(
             for rel_idx in rel_route:
                 geo.at[int(idxs[rel_idx]), "Day"] = f"Day {day_counter}"
             day_counter += 1
-
-        if stats:
-            drive_minutes_acc.extend(stats.get("drive_minutes", []))
-            service_minutes_acc.extend(stats.get("service_minutes", []))
 
     if group_col:
         for group_val in geo[group_col].unique():
@@ -2925,10 +3099,10 @@ async def cluster_only(
         "solver_counts": solver_counts,
         "service_column": service_col,
         "default_service_minutes": CLUSTER_DEFAULT_SERVICE_MIN if service_col is None else None,
-        "median_drive_minutes": float(np.median(drive_minutes_acc)) if drive_minutes_acc else None,
-        "median_service_minutes": float(np.median(service_minutes_acc)) if service_minutes_acc else None,
         "median_target_minutes": float(np.median(target_minutes_acc)) if target_minutes_acc else None,
     }
+    if sa_polished_groups:
+        meta["sa_polished_groups"] = int(sa_polished_groups)
     if fallback_notes:
         meta["solver_notes"] = fallback_notes[:20]
     project_id = _maybe_save_project(
