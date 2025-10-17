@@ -24,135 +24,17 @@ import pandas as pd
 import requests
 import googlemaps
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from health import router as health_router
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-from project_store import build_store_from_env
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 try:
-    import duckdb as _duckdb  # type: ignore
-    _DUCKDB_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    _duckdb = None  # type: ignore
-    _DUCKDB_AVAILABLE = False
-
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-GOOGLE_QPS = float(os.getenv("GOOGLE_QPS", "5"))
-GOOGLE_TIMEOUT = float(os.getenv("GOOGLE_TIMEOUT", "10"))
-GOOGLE_RETRY_TIMEOUT = float(os.getenv("GOOGLE_RETRY_TIMEOUT", "60"))
-
-if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY must be configured")
-
-try:
-    gmaps = googlemaps.Client(
-        key=GOOGLE_API_KEY,
-        queries_per_second=max(1.0, GOOGLE_QPS),
-        timeout=GOOGLE_TIMEOUT,
-        retry_timeout=GOOGLE_RETRY_TIMEOUT,
-    )
-except Exception as exc:
-    raise RuntimeError(f"Failed to initialise Google Maps client: {exc}") from exc
-
-_cors_origins_env = os.getenv("ALLOWED_ORIGINS") or os.getenv("CORS_ALLOW_ORIGINS", "*")
-_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
-if not _cors_origins:
-    _cors_origins = ["*"]
-if "*" in _cors_origins:
-    _cors_origins = ["*"]
-
-app = FastAPI(title="LeeWay API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Health endpoint
-app.include_router(health_router)
-
-logger = logging.getLogger("leeway.api")
-
-# Try new OR-Tools API first, then legacy
-_HAS_FLOW = False
-_mcf_mod = None
-_UPLOAD_FILE_TYPES = (UploadFile, StarletteUploadFile)
-
-_PROJECT_SERVICE_TOKEN = os.getenv("PROJECT_SERVICE_TOKEN", "").strip()
-_PROJECT_STORE = None
-_PROJECT_STORE_ERROR_LOGGED = False
-
-
-def _get_project_store():
-    global _PROJECT_STORE, _PROJECT_STORE_ERROR_LOGGED
-    if _PROJECT_STORE is None:
-        try:
-            _PROJECT_STORE = build_store_from_env()
-            _PROJECT_STORE_ERROR_LOGGED = False
-        except Exception as exc:  # pragma: no cover - configuration issue
-            if not _PROJECT_STORE_ERROR_LOGGED:
-                print(f"[WARN] Project store unavailable: {exc}")
-                _PROJECT_STORE_ERROR_LOGGED = True
-            _PROJECT_STORE = None
-    return _PROJECT_STORE
-
-
-def _get_header_value(source: Union[Request, Mapping[str, Any], None], key: str) -> Optional[str]:
-    if source is None:
-        return None
-    if isinstance(source, Request):
-        return source.headers.get(key)
-    if isinstance(source, Mapping):
-        for variant in (key, key.lower(), key.upper()):
-            if variant in source:
-                value = source[variant]
-                if isinstance(value, (list, tuple)):
-                    value = value[0] if value else None
-                if value is None:
-                    continue
-                return str(value)
-    return None
-
-
-def _service_token_valid(token: Optional[str]) -> bool:
-    if not token or not _PROJECT_SERVICE_TOKEN:
-        return False
-    try:
-        return hmac.compare_digest(str(token).strip(), _PROJECT_SERVICE_TOKEN)
-    except Exception:
-        return str(token).strip() == _PROJECT_SERVICE_TOKEN
-
-
-def _require_project_access(request: Request):
-    store = _get_project_store()
-    if store is None:
-        raise HTTPException(503, "Project storage unavailable")
-    if not _PROJECT_SERVICE_TOKEN:
-        raise HTTPException(503, "PROJECT_SERVICE_TOKEN not configured")
-    token = _get_header_value(request, "X-Service-Token")
-    if not _service_token_valid(token):
-        raise HTTPException(403, "Invalid service token")
-    user_id = (
-        _get_header_value(request, "X-User-Id")
-        or _get_header_value(request, "X-User-ID")
-        or _get_header_value(request, "X-Project-User")
-    )
-    if not user_id or not str(user_id).strip():
-        raise HTTPException(400, "X-User-Id header required")
-    return store, str(user_id).strip()
-
-
-def _maybe_save_project(
-    headers_source: Union[Request, Mapping[str, Any], None],
-    *,
-    mode: str,
-    rows: List[List[Any]],
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2  # type: ignore
+    _HAS_ORTOOLS = True
+except Exception:  # pragma: no cover - allow start without OR-Tools for tooling
+    pywrapcp = None  # type: ignore
+    routing_enums_pb2 = None  # type: ignore
+    _HAS_ORTOOLS = False
+    # Duplicate route handler removed; Celery-queued version is defined earlier.
     meta: Optional[Dict[str, Any]] = None,
     explicit_name: Optional[str] = None,
 ) -> Optional[int]:
@@ -218,8 +100,6 @@ async def delete_project(project_id: int, request: Request):
     return {"deleted": True}
 
 
-def _new_mcf():
-    raise RuntimeError("Min-cost flow module not available")
 @app.post("/api/vehicle-route")
 async def vehicle_route(request: Request):
     form = await request.form()
@@ -229,20 +109,14 @@ async def vehicle_route(request: Request):
         pass
     calls_file = form.get("callsFile")
     resources_file = form.get("resourcesFile")
-    print(
-        "[DEBUG] callsFile type:", type(calls_file),
-        "resourcesFile type:", type(resources_file),
-        "isinstance callsFile:", isinstance(calls_file, _UPLOAD_FILE_TYPES),
-        "isinstance resourcesFile:", isinstance(resources_file, _UPLOAD_FILE_TYPES),
-    )
-    if not isinstance(calls_file, _UPLOAD_FILE_TYPES):
+    if not isinstance(calls_file, (UploadFile, StarletteUploadFile)):
         raise HTTPException(400, "callsFile upload is required")
-    if not isinstance(resources_file, _UPLOAD_FILE_TYPES):
+    if not isinstance(resources_file, (UploadFile, StarletteUploadFile)):
         raise HTTPException(400, "resourcesFile upload is required")
 
     params: Dict[str, Any] = {}
     for key, value in form.items():
-        if isinstance(value, _UPLOAD_FILE_TYPES):
+        if isinstance(value, (UploadFile, StarletteUploadFile)):
             continue
         params[key] = value if isinstance(value, str) else ("" if value is None else str(value))
 
@@ -344,7 +218,6 @@ def vehicle_route_result(task_id: str):
         "result": data,
     })
 
-
 # Optional H3 contiguity penalty config
 try:
     import h3
@@ -373,6 +246,25 @@ CORRIDOR_SIGMA_DEG = float(os.getenv("CORRIDOR_SIGMA_DEG", "15"))
 CORRIDOR_BETA = float(os.getenv("CORRIDOR_BETA", "0.25"))
 SMOOTH_ITERS = int(os.getenv("SMOOTH_ITERS", "40"))  # double smoothing passes
 VRP_TIME_BUDGET_ENABLED = int(os.getenv("VRP_TIME_BUDGET_ENABLED", "0"))  # 1: enable time-budget route mode
+VRP_PRECLUSTER = int(os.getenv("VRP_PRECLUSTER", "1"))  # 1: precluster per-day to compact days
+VRP_CLUSTER_MIN_RATIO = float(os.getenv("VRP_CLUSTER_MIN_RATIO", "0.8"))  # min_calls = ratio * max_calls
+VRP_PRECLUSTER_METHOD = (os.getenv("VRP_PRECLUSTER_METHOD", "kmedoids").strip().lower() or "kmedoids")
+VRP_PRECLUSTER_OSRM_MAX_N = int(os.getenv("VRP_PRECLUSTER_OSRM_MAX_N", "80"))  # above this, avoid OSRM in k-medoids
+VRP_KMEDOIDS_OSRM_CENTERS = int(os.getenv("VRP_KMEDOIDS_OSRM_CENTERS", "1"))  # if 1, use OSRM only for coords->centers matrix
+VRP_ROUTE_TIME_LIMIT_SEC = int(os.getenv("VRP_ROUTE_TIME_LIMIT_SEC", "15"))  # per-route solver time limit
+VRP_META = (os.getenv("VRP_META", "gls").strip().lower() or "gls")  # gls|sa|greedy
+VRP_FIRST = (os.getenv("VRP_FIRST", "parallel_cheapest_insertion").strip().lower() or "parallel_cheapest_insertion")
+VRP_MS_TRIES = max(1, int(os.getenv("VRP_MS_TRIES", "3")))  # multi-start attempts per route/territory
+VRP_MS_TOTAL_SEC = max(0, int(os.getenv("VRP_MS_TOTAL_SEC", "0")))  # 0 = disabled; otherwise cap total search seconds across tries
+VRP_NUM_WORKERS = max(1, int(os.getenv("VRP_NUM_WORKERS", str(os.cpu_count() or 1))))
+VRP_DROP_PENALTY = max(1, int(os.getenv("VRP_DROP_PENALTY", "10000000")))  # discourage dropping
+VRP_LNS_TIME_SEC = max(0, int(os.getenv("VRP_LNS_TIME_SEC", "1")))  # 0 to disable LNS; small positive for mild improvement
+
+CLUSTER_OSRM_MAX_N = int(os.getenv("CLUSTER_OSRM_MAX_N", "140"))
+CLUSTER_DEFAULT_SERVICE_MIN = float(os.getenv("CLUSTER_DEFAULT_SERVICE_MIN", "45"))
+CLUSTER_SOLVER_TIME_SEC = int(os.getenv("CLUSTER_SOLVER_TIME_SEC", "20"))
+CLUSTER_BASE_DAY_MINUTES = float(os.getenv("CLUSTER_BASE_DAY_MINUTES", "240"))
+CLUSTER_DURATION_PENALTY = float(os.getenv("CLUSTER_DURATION_PENALTY", "12.0"))
 
 _OSRM_BASE_RAW = (
     os.getenv("OSRM_BASE")
@@ -393,6 +285,12 @@ def _get_osrm_url() -> str:
 OSRM_URL = _get_osrm_url()
 
 _OSRM_SESSION_LOCAL = threading.local()
+# OSRM diagnostics
+OSRM_STRICT = int(os.getenv("OSRM_STRICT", "0"))
+_OSRM_REQ_COUNT = 0
+_OSRM_ERR_COUNT = 0
+_OSRM_FALLBACK_COUNT = 0
+_OSRM_LAST_ERROR: Optional[str] = None
 OSRM_REQUEST_ATTEMPTS = max(1, int(os.getenv("OSRM_REQUEST_ATTEMPTS", "5")))
 OSRM_REQUEST_TIMEOUT = float(os.getenv("OSRM_REQUEST_TIMEOUT", "20"))
 OSRM_REQUEST_BACKOFF_BASE = float(os.getenv("OSRM_REQUEST_BACKOFF_BASE", "0.75"))
@@ -436,6 +334,7 @@ def _osrm_backoff_delay(attempt: int) -> float:
 
 
 def _fetch_osrm_matrix(url: str, *, expected_key: str) -> List[List[float]]:
+    global _OSRM_REQ_COUNT, _OSRM_ERR_COUNT, _OSRM_LAST_ERROR
     session = _get_osrm_session()
     last_exc: Optional[Exception] = None
     for attempt in range(OSRM_REQUEST_ATTEMPTS):
@@ -445,6 +344,10 @@ def _fetch_osrm_matrix(url: str, *, expected_key: str) -> List[List[float]]:
             if response.status_code == 200:
                 data = response.json()
                 if expected_key in data:
+                    try:
+                        _OSRM_REQ_COUNT += 1
+                    except Exception:
+                        pass
                     return data[expected_key]
                 last_exc = RuntimeError(f"OSRM response missing key '{expected_key}'")
             else:
@@ -466,6 +369,11 @@ def _fetch_osrm_matrix(url: str, *, expected_key: str) -> List[List[float]]:
         if attempt + 1 < OSRM_REQUEST_ATTEMPTS:
             time.sleep(_osrm_backoff_delay(attempt))
     if last_exc:
+        try:
+            _OSRM_ERR_COUNT += 1
+            _OSRM_LAST_ERROR = str(last_exc)
+        except Exception:
+            pass
         raise RuntimeError(
             f"OSRM {expected_key} table failed after {OSRM_REQUEST_ATTEMPTS} attempts. Last error: {last_exc}"
         )
@@ -586,6 +494,7 @@ OSRM_FALLBACK_SPEED_MPS = float(os.getenv("OSRM_FALLBACK_SPEED_MPS", "13.8889"))
 
 
 def _duration_block(loc_from: np.ndarray, loc_to: np.ndarray, *, depth: int = 0) -> np.ndarray:
+    global _OSRM_FALLBACK_COUNT
     """Fetch an OSRM duration block, recursively splitting on failure."""
     if len(loc_from) == 0 or len(loc_to) == 0:
         return np.zeros((len(loc_from), len(loc_to)), dtype=float)
@@ -621,6 +530,12 @@ def _duration_block(loc_from: np.ndarray, loc_to: np.ndarray, *, depth: int = 0)
                 "Falling back to haversine duration for single pair (dist=%.2fm)",
                 dist_m,
             )
+            try:
+                _OSRM_FALLBACK_COUNT += 1
+            except Exception:
+                pass
+            if OSRM_STRICT:
+                raise RuntimeError("OSRM_STRICT=1: duration fallback disabled")
             return np.array([[approx]], dtype=float)
 
         # Recursively split the larger dimension to reduce payload size.
@@ -645,6 +560,12 @@ def _duration_block(loc_from: np.ndarray, loc_to: np.ndarray, *, depth: int = 0)
             len(loc_to),
             exc,
         )
+        try:
+            _OSRM_FALLBACK_COUNT += int(len(loc_from) * len(loc_to))
+        except Exception:
+            pass
+        if OSRM_STRICT:
+            raise RuntimeError("OSRM_STRICT=1: duration fallback disabled")
         return approx
 
 
@@ -796,6 +717,46 @@ def k_medoids(D: np.ndarray, k: int, iters: int = 25, random_state: int = 42) ->
         if not improved:
             break
     return medoids
+
+
+def _precluster_days_kmedoids(
+    coords: np.ndarray,
+    max_calls: int,
+    min_ratio: float,
+    lam: float,
+) -> List[List[int]]:
+    """Partition coords into up to k day-sized, compact groups using OSRM road distances + k-medoids
+    + H3 contiguity penalty during balanced assign.
+    Returns relative index groups.
+    """
+    n = len(coords)
+    if n == 0:
+        return []
+    if max_calls <= 0:
+        return [list(range(n))]
+    k = max(1, int(math.ceil(n / max_calls)))
+    # Use haversine for k-medoids (fast, robust). Only compute OSRM to centers if enabled.
+    D_hav = _haversine_matrix_full(coords)
+    meds = k_medoids(D_hav, k, iters=15, random_state=42)
+    # Distances from every call to chosen centers
+    if int(VRP_KMEDOIDS_OSRM_CENTERS) and n <= max(1, int(VRP_PRECLUSTER_OSRM_MAX_N)):
+        try:
+            centers = coords[np.array(meds, dtype=int)]
+            D_to_centers = osrm_matrix_between(coords, centers)  # road distances to centers only (n x k)
+        except Exception:
+            D_to_centers = D_hav[:, meds]
+    else:
+        D_to_centers = D_hav[:, meds]
+    min_calls = max(1, int(math.floor((min_ratio if min_ratio is not None else 0.0) * max_calls)))
+    try:
+        hex_ids = _hex_ids_for_coords(coords, H3_PLAN_RES)
+    except Exception:
+        hex_ids = None
+    assign = balanced_assign(D_to_centers, min_calls=min_calls, max_calls=int(max_calls), hex_ids=hex_ids, lam=float(lam or 0.0))
+    groups: List[List[int]] = [[] for _ in range(max(1, int(np.max(assign))+1))]
+    for i, a in enumerate(assign):
+        groups[int(a)].append(int(i))
+    return [g for g in groups if g]
 
 
 # ----------------------------
@@ -1069,6 +1030,214 @@ def cvrp_days_for_territory(
 
 
 # ----------------------------
+# Cluster helper utilities
+# ----------------------------
+def _infer_service_seconds(df: pd.DataFrame) -> Tuple[List[int], Optional[str]]:
+    candidates = (
+        "duration", "dur", "mins", "minutes", "minute", "service", "servicetime",
+        "calltime", "visittime", "appt", "appointment", "length"
+    )
+    default_sec = int(max(1.0, CLUSTER_DEFAULT_SERVICE_MIN) * 60)
+    picked: Optional[str] = None
+    for col in df.columns:
+        key = str(col).lower()
+        if any(token in key for token in candidates):
+            picked = col
+            break
+    if picked is None:
+        return [default_sec for _ in range(len(df))], None
+    series = df[picked]
+    out: List[int] = []
+    for val in series:
+        sec = parse_hhmm_to_seconds(val)
+        if sec <= 0:
+            sec = default_sec
+        out.append(int(sec))
+    return out, picked
+
+
+def _estimate_target_minutes(service_seconds: np.ndarray, max_calls: int) -> float:
+    if len(service_seconds) == 0:
+        return max(CLUSTER_BASE_DAY_MINUTES, CLUSTER_DEFAULT_SERVICE_MIN * max(1, max_calls))
+    median_sec = float(np.median(service_seconds)) if np.any(service_seconds) else 0.0
+    if median_sec <= 0:
+        median_sec = CLUSTER_DEFAULT_SERVICE_MIN * 60.0
+    max_calls_eff = max(1, int(max_calls) if max_calls and max_calls > 0 else len(service_seconds))
+    est = (median_sec * max_calls_eff) / 60.0
+    return max(CLUSTER_BASE_DAY_MINUTES, est)
+
+
+def _cluster_days_vrp(
+    terr_coords: np.ndarray,
+    service_seconds: np.ndarray,
+    depot_lat_lng: Tuple[float, float],
+    min_calls: int,
+    max_calls: int,
+    solver_time_limit: int,
+    target_minutes: float,
+    seed: int = 42,
+) -> Tuple[List[List[int]], Dict[str, Any]]:
+    if not _HAS_ORTOOLS:
+        raise RuntimeError("OR-Tools not available")
+    n = int(len(terr_coords))
+    if n == 0:
+        return [], {"drive_minutes": [], "service_minutes": [], "target_day_minutes": target_minutes}
+
+    depot = np.array([[float(depot_lat_lng[0]), float(depot_lat_lng[1])]], dtype=float)
+    all_pts = np.vstack([terr_coords.astype(float), depot])
+    dm = osrm_table_batch_duration(all_pts)
+    depot_idx = n
+
+    manager = pywrapcp.RoutingIndexManager(n + 1, 1, depot_idx)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def travel_cb(from_index: int, to_index: int) -> int:
+        f = manager.IndexToNode(from_index)
+        t = manager.IndexToNode(to_index)
+        return int(max(0, dm[f, t]))
+
+    transit = routing.RegisterTransitCallback(travel_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit)
+
+    hard_penalty = max(10_000_000, VRP_DROP_PENALTY)
+    for i in range(n):
+        routing.AddDisjunction([routing.NodeToIndex(i)], hard_penalty)
+
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    try:
+        first_map = {
+            "parallel_cheapest_insertion": routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
+            "path_cheapest_arc": routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
+            "savings": routing_enums_pb2.FirstSolutionStrategy.SAVINGS,
+            "all_unperformed": routing_enums_pb2.FirstSolutionStrategy.ALL_UNPERFORMED,
+        }
+        params.first_solution_strategy = first_map.get(VRP_FIRST, routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
+    except Exception:
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    try:
+        meta = (VRP_META or "gls").lower()
+        if meta in ("gls", "guided", "guided_local_search"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        elif meta in ("sa", "anneal", "simulated_annealing"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.SIMULATED_ANNEALING
+        else:
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
+    except Exception:
+        pass
+    try:
+        params.random_seed = int(seed)
+    except Exception:
+        params.random_seed = 42
+    params.time_limit.seconds = max(3, int(solver_time_limit or CLUSTER_SOLVER_TIME_SEC))
+    params.log_search = False
+
+    tries = max(1, int(VRP_MS_TRIES))
+    best_solution = None
+    best_obj = None
+    for t in range(tries):
+        try:
+            params.random_seed = int(seed + t * 7919)
+        except Exception:
+            pass
+        sol = routing.SolveWithParameters(params)
+        if not sol:
+            continue
+        obj = sol.ObjectiveValue()
+        if best_solution is None or obj < best_obj:
+            best_solution = sol
+            best_obj = obj
+    solution = best_solution
+    if not solution:
+        raise RuntimeError("OR-Tools failed to compute tour")
+
+    order: List[int] = []
+    idx = routing.Start(0)
+    while not routing.IsEnd(idx):
+        node = manager.IndexToNode(idx)
+        if node != depot_idx:
+            order.append(int(node))
+        idx = solution.Value(routing.NextVar(idx))
+    if len(order) != n:
+        missing = sorted(set(range(n)) - set(order))
+        order.extend(missing)
+
+    min_calls_eff = max(1, int(min_calls) if min_calls and min_calls > 0 else 1)
+    max_calls_eff = int(max_calls) if max_calls and max_calls > 0 else n
+    max_calls_eff = max(min_calls_eff, max_calls_eff)
+    svc = service_seconds.astype(float)
+
+    prefix_service = [0.0]
+    for node in order:
+        prefix_service.append(prefix_service[-1] + float(svc[node]))
+    prefix_edges = [0.0]
+    for pos in range(1, len(order)):
+        prev = order[pos - 1]
+        cur = order[pos]
+        prefix_edges.append(prefix_edges[-1] + float(dm[prev, cur]))
+
+    target_minutes = max(1.0, float(target_minutes))
+
+    def _chunk_cost(i: int, j: int) -> float:
+        start = order[i]
+        end = order[j - 1]
+        travel = float(dm[depot_idx, start]) + float(dm[end, depot_idx])
+        if j - i > 1:
+            travel += float(prefix_edges[j - 1] - prefix_edges[i])
+        service = float(prefix_service[j] - prefix_service[i])
+        svc_minutes = service / 60.0
+        travel_minutes = travel / 60.0
+        over = max(0.0, svc_minutes - target_minutes)
+        penalty = over * over * CLUSTER_DURATION_PENALTY
+        return travel_minutes + penalty
+
+    n_order = len(order)
+    dp = [math.inf] * (n_order + 1)
+    choice = [-1] * (n_order + 1)
+    dp[n_order] = 0.0
+    for i in range(n_order - 1, -1, -1):
+        max_j = min(n_order, i + max_calls_eff)
+        min_j = max(i + min_calls_eff, i + 1)
+        for j in range(min_j, max_j + 1):
+            remaining = n_order - j
+            if remaining > 0 and remaining < min_calls_eff:
+                continue
+            cost = _chunk_cost(i, j) + dp[j]
+            if cost < dp[i]:
+                dp[i] = cost
+                choice[i] = j
+
+    routes: List[List[int]] = []
+    cursor = 0
+    while cursor < n_order and choice[cursor] != -1:
+        nxt = choice[cursor]
+        routes.append(order[cursor:nxt])
+        cursor = nxt
+    if cursor < n_order:
+        routes.append(order[cursor:])
+
+    if not routes:
+        routes = [order[:]]
+
+    drive_minutes: List[float] = []
+    service_minutes: List[float] = []
+    for seg in routes:
+        if not seg:
+            continue
+        travel = float(dm[depot_idx, seg[0]]) + float(dm[seg[-1], depot_idx])
+        for a, b in zip(seg[:-1], seg[1:]):
+            travel += float(dm[a, b])
+        service_total = sum(float(svc[node]) for node in seg)
+        drive_minutes.append(round(travel / 60.0, 3))
+        service_minutes.append(round(service_total / 60.0, 3))
+
+    return routes, {
+        "drive_minutes": drive_minutes,
+        "service_minutes": service_minutes,
+        "target_day_minutes": target_minutes,
+    }
+
+
+# ----------------------------
 # Helpers for VRP with time windows
 # ----------------------------
 _DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
@@ -1245,6 +1414,7 @@ def vrp_single_route_with_time(
     time_limit_sec: int = 20,
     max_stops: Optional[int] = None,
     seed: Optional[int] = 42,
+    durations_matrix: Optional[np.ndarray] = None,
 ) -> Tuple[List[int], List[int]]:
     """
     Solve a single-vehicle route visiting a subset of coords (may drop nodes) within the time window.
@@ -1255,7 +1425,7 @@ def vrp_single_route_with_time(
         return [], []
     depot = np.array([depot_lat_lng], dtype=float)
     all_pts = np.vstack([coords, depot])
-    dm = osrm_table_batch_duration(all_pts)
+    dm = durations_matrix if durations_matrix is not None else osrm_table_batch_duration(all_pts)
     depot_node = n
 
     manager = pywrapcp.RoutingIndexManager(n + 1, 1, depot_node)
@@ -1299,27 +1469,77 @@ def vrp_single_route_with_time(
         routing.AddDimensionWithVehicleCapacity(count, 0, [int(max_stops)], True, 'Count')
 
     # Allow dropping nodes with a penalty
-    penalty = 10_000_000  # large penalty to discourage dropping unless infeasible
+    penalty = int(VRP_DROP_PENALTY)
     for i in range(n):
         index = manager.NodeToIndex(i)
         time_dim.CumulVar(index).SetRange(start, end)
         routing.AddDisjunction([index], penalty)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    # Deterministic local search
+    # Good first solution to seed local search (tunable)
     try:
-        params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
+        first_map = {
+            "parallel_cheapest_insertion": routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
+            "path_cheapest_arc": routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
+            "savings": routing_enums_pb2.FirstSolutionStrategy.SAVINGS,
+            "all_unperformed": routing_enums_pb2.FirstSolutionStrategy.ALL_UNPERFORMED,
+        }
+        params.first_solution_strategy = first_map.get(VRP_FIRST, routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
+    except Exception:
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    # Metaheuristic (configurable: gls|sa|greedy)
+    try:
+        meta = (VRP_META or "gls").lower()
+        if meta in ("gls", "guided", "guided_local_search"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        elif meta in ("sa", "anneal", "simulated_annealing"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.SIMULATED_ANNEALING
+        else:
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
     except Exception:
         pass
     try:
         params.random_seed = int(seed or 42)
     except Exception:
         pass
-    params.time_limit.seconds = max(5, int(time_limit_sec))
+    # Per-route time limit (env overrides function arg if set)
+    route_limit = int(VRP_ROUTE_TIME_LIMIT_SEC or 0) or int(time_limit_sec or 0) or 15
+    params.time_limit.seconds = max(5, route_limit)
+    try:
+        params.number_of_workers = int(VRP_NUM_WORKERS)
+    except Exception:
+        pass
     params.log_search = False
+    # Optional LNS time
+    try:
+        if int(VRP_LNS_TIME_SEC) > 0:
+            params.lns_time_limit.seconds = int(VRP_LNS_TIME_SEC)
+    except Exception:
+        pass
 
-    solution = routing.SolveWithParameters(params)
+    # Multi-start: retry with different seeds and keep the best
+    best_solution = None
+    best_obj = None
+    total_deadline = None
+    if int(VRP_MS_TOTAL_SEC) > 0:
+        total_deadline = time.time() + int(VRP_MS_TOTAL_SEC)
+    tries = max(1, int(VRP_MS_TRIES))
+    for t in range(tries):
+        if total_deadline is not None and time.time() >= total_deadline:
+            break
+        try:
+            params.random_seed = int((seed or 42) + t * 9973)
+        except Exception:
+            pass
+        sol = routing.SolveWithParameters(params)
+        if not sol:
+            continue
+        # objective: total arc cost
+        obj = sol.ObjectiveValue()
+        if best_solution is None or obj < best_obj:
+            best_solution = sol
+            best_obj = obj
+    solution = best_solution
     if not solution:
         return [], list(range(n))
 
@@ -1455,11 +1675,23 @@ def vrp_routes_time_budget(
     # Search params
     params = pywrapcp.DefaultRoutingSearchParameters()
     try:
-        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        first_map = {
+            "parallel_cheapest_insertion": routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION,
+            "path_cheapest_arc": routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
+            "savings": routing_enums_pb2.FirstSolutionStrategy.SAVINGS,
+            "all_unperformed": routing_enums_pb2.FirstSolutionStrategy.ALL_UNPERFORMED,
+        }
+        params.first_solution_strategy = first_map.get(VRP_FIRST, routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
     except Exception:
         params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     try:
-        params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
+        meta = (VRP_META or "gls").lower()
+        if meta in ("gls", "guided", "guided_local_search"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        elif meta in ("sa", "anneal", "simulated_annealing"):
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.SIMULATED_ANNEALING
+        else:
+            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
     except Exception:
         pass
     try:
@@ -1467,13 +1699,34 @@ def vrp_routes_time_budget(
     except Exception:
         pass
     params.time_limit.seconds = max(5, int(time_limit_sec))
-    # Optional mild LNS if available
     try:
-        params.lns_time_limit.seconds = 1
+        params.number_of_workers = int(VRP_NUM_WORKERS)
+    except Exception:
+        pass
+    # Optional LNS time if available
+    try:
+        if int(VRP_LNS_TIME_SEC) > 0:
+            params.lns_time_limit.seconds = int(VRP_LNS_TIME_SEC)
     except Exception:
         pass
 
-    solution = routing.SolveWithParameters(params)
+    # Multi-start best-of
+    best_solution = None
+    best_obj = None
+    tries = max(1, int(VRP_MS_TRIES))
+    for t in range(tries):
+        try:
+            params.random_seed = int((seed or 42) + t * 7919)
+        except Exception:
+            pass
+        sol = routing.SolveWithParameters(params)
+        if not sol:
+            continue
+        obj = sol.ObjectiveValue()
+        if best_solution is None or obj < best_obj:
+            best_solution = sol
+            best_obj = obj
+    solution = best_solution
     routes: List[List[int]] = []
     if solution:
         for v in range(num_vehicles):
@@ -2098,9 +2351,6 @@ async def territory_plan(
     df["Latitude"] = latitudes
     df["Longitude"] = longitudes
     failed_rows = df.iloc[failed_indices].copy() if failed_indices else []
-    geo = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
-    if geo.empty:
-        raise HTTPException(400, "No valid coordinates after geocoding.")
 
     # Select group column if provided
     group_col = None
@@ -2404,6 +2654,14 @@ async def cluster_only(
     if geo.empty:
         raise HTTPException(400, "No valid coordinates after geocoding.")
 
+    service_seconds_all, service_col = _infer_service_seconds(df)
+    df["_service_seconds"] = service_seconds_all
+    geo = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+    if geo.empty:
+        raise HTTPException(400, "No valid coordinates after geocoding.")
+
+    service_seconds = geo["_service_seconds"].to_numpy(dtype=float)
+
     # Resolve group column: use provided or auto-detect; if none, treat all rows as one group
     group_col = None
     if groupCol and groupCol.lower() in [c.lower() for c in geo.columns]:
@@ -2416,51 +2674,95 @@ async def cluster_only(
                 group_col = lower_cols[cand]
                 break
 
+    minCalls = max(0, int(minCalls))
+    maxCalls = int(maxCalls)
+    if maxCalls <= 0:
+        maxCalls = len(geo)
+    if maxCalls < minCalls:
+        raise HTTPException(400, "maxCalls must be >= minCalls")
+
     coords = geo[["Latitude", "Longitude"]].astype(float).to_numpy()
     geo["Day"] = ""
 
+    solver_limit = int(dayTimeLimitSec or CLUSTER_SOLVER_TIME_SEC)
+    solver_counts = {"ortools": 0, "fallback": 0}
+    drive_minutes_acc: List[float] = []
+    service_minutes_acc: List[float] = []
+    target_minutes_acc: List[float] = []
+    fallback_notes: List[str] = []
+
+    def _choose_depot(points: np.ndarray) -> Tuple[float, float]:
+        if len(points) == 0:
+            return (0.0, 0.0)
+        if len(points) == 1:
+            return (float(points[0, 0]), float(points[0, 1]))
+        try:
+            if len(points) <= CLUSTER_OSRM_MAX_N:
+                D = osrm_table_batch(points)
+                med = int(k_medoids(D, 1, iters=10, random_state=42)[0])
+                return (float(points[med, 0]), float(points[med, 1]))
+        except Exception:
+            pass
+        return (float(np.mean(points[:, 0])), float(np.mean(points[:, 1])))
+
+    def _cluster_indices(idxs: np.ndarray, note_key: str) -> None:
+        nonlocal solver_counts
+        if len(idxs) == 0:
+            return
+        terr_coords = coords[idxs]
+        svc_local = service_seconds[idxs]
+        depot_lat_lng = _choose_depot(terr_coords)
+        target_minutes = _estimate_target_minutes(svc_local, maxCalls)
+    target_minutes_acc.append(float(target_minutes))
+        routes: List[List[int]]
+        stats: Optional[Dict[str, Any]] = None
+        if len(terr_coords) == 1:
+            routes = [[0]]
+            stats = {
+                "drive_minutes": [0.0],
+                "service_minutes": [round(float(svc_local[0]) / 60.0, 3)],
+                "target_day_minutes": target_minutes,
+            }
+        elif len(terr_coords) <= CLUSTER_OSRM_MAX_N:
+            try:
+                routes, stats = _cluster_days_vrp(
+                    terr_coords,
+                    svc_local,
+                    depot_lat_lng,
+                    minCalls,
+                    maxCalls,
+                    solver_limit,
+                    target_minutes,
+                )
+                solver_counts["ortools"] += len([r for r in routes if r])
+            except Exception as exc:
+                solver_counts["fallback"] += 1
+                fallback_notes.append(f"{note_key}: {exc}")
+                routes = cvrp_days_for_territory(terr_coords, depot_lat_lng, minCalls, maxCalls)
+        else:
+            solver_counts["fallback"] += 1
+            fallback_notes.append(f"{note_key}: skipped OR-Tools (size>{CLUSTER_OSRM_MAX_N})")
+            routes = cvrp_days_for_territory(terr_coords, depot_lat_lng, minCalls, maxCalls)
+
+        day_counter = 1
+        for rel_route in routes:
+            if not rel_route:
+                continue
+            for rel_idx in rel_route:
+                geo.at[int(idxs[rel_idx]), "Day"] = f"Day {day_counter}"
+            day_counter += 1
+
+        if stats:
+            drive_minutes_acc.extend(stats.get("drive_minutes", []))
+            service_minutes_acc.extend(stats.get("service_minutes", []))
+
     if group_col:
-        # Cluster days within each existing group
-        total_routes = 0
         for group_val in geo[group_col].unique():
             mask = (geo[group_col] == group_val).to_numpy()
             idxs = np.where(mask)[0]
-            if len(idxs) == 0:
-                continue
-            terr_coords = coords[idxs]
-            # Depot = medoid of the group's coords
-            if len(terr_coords) == 1:
-                depot_lat_lng = (float(terr_coords[0, 0]), float(terr_coords[0, 1]))
-            else:
-                D = osrm_table_batch(terr_coords)
-                medoid = k_medoids(D, 1, iters=10, random_state=42)[0]
-                depot_lat_lng = (float(terr_coords[medoid, 0]), float(terr_coords[medoid, 1]))
-            routes = cvrp_days_for_territory(
-                terr_coords, depot_lat_lng, minCalls, maxCalls, time_sec=int(dayTimeLimitSec or 30)
-            )
-            total_routes += len(routes)
-            for i, day_idxs in enumerate(routes, start=1):
-                for rel_idx in day_idxs:
-                    abs_idx = idxs[rel_idx]
-                    geo.at[abs_idx, "Day"] = f"Day {i}"
-        days_msg = total_routes
+            _cluster_indices(idxs, f"group {group_val}")
     else:
-        # No group column → cluster the entire dataset into days
-        terr_coords = coords
-        if len(terr_coords) == 0:
-            routes = []
-        elif len(terr_coords) == 1:
-            depot_lat_lng = (float(terr_coords[0, 0]), float(terr_coords[0, 1]))
-            routes = cvrp_days_for_territory(terr_coords, depot_lat_lng, minCalls, maxCalls, time_sec=int(dayTimeLimitSec or 30))
-        else:
-            D = osrm_table_batch(terr_coords)
-            medoid = k_medoids(D, 1, iters=10, random_state=42)[0]
-            depot_lat_lng = (float(terr_coords[medoid, 0]), float(terr_coords[medoid, 1]))
-            routes = cvrp_days_for_territory(terr_coords, depot_lat_lng, minCalls, maxCalls, time_sec=int(dayTimeLimitSec or 30))
-        for i, day_idxs in enumerate(routes, start=1):
-            for rel_idx in day_idxs:
-                geo.at[rel_idx, "Day"] = f"Day {i}"
-        days_msg = len(routes)
+        _cluster_indices(np.arange(len(geo)), "all")
 
     # Derive DayNumber and CallsPerDay
     def _day_num(v):
@@ -2470,6 +2772,7 @@ async def cluster_only(
             return int(m.group(1)) if m else None
         except Exception:
             return None
+
     geo["DayNumber"] = geo["Day"].map(_day_num)
     if group_col:
         cts = geo.groupby([group_col, "Day"]).size().rename("CallsPerDay").reset_index()
@@ -2477,6 +2780,10 @@ async def cluster_only(
     else:
         cts = geo.groupby(["Day"]).size().rename("CallsPerDay").reset_index()
         geo = geo.merge(cts, on=["Day"], how="left")
+
+    days_msg = int(len({d for d in geo["Day"] if d}))
+
+    geo = geo.drop(columns=["_service_seconds"], errors="ignore")
 
     # Prepare output rows with Day columns
     outCols = [c for c in geo.columns if c not in ("Latitude", "Longitude", "Day", "DayNumber", "CallsPerDay")]
@@ -2489,7 +2796,15 @@ async def cluster_only(
         "days": int(days_msg),
         "grouped": bool(group_col),
         "failed_geocodes": len(failed_rows),
+        "solver_counts": solver_counts,
+        "service_column": service_col,
+        "default_service_minutes": CLUSTER_DEFAULT_SERVICE_MIN if service_col is None else None,
+        "median_drive_minutes": float(np.median(drive_minutes_acc)) if drive_minutes_acc else None,
+        "median_service_minutes": float(np.median(service_minutes_acc)) if service_minutes_acc else None,
+        "median_target_minutes": float(np.median(target_minutes_acc)) if target_minutes_acc else None,
     }
+    if fallback_notes:
+        meta["solver_notes"] = fallback_notes[:20]
     project_id = _maybe_save_project(
         request,
         mode="cluster",
@@ -2719,7 +3034,7 @@ async def _vehicle_route_run_from_bytes(
     # Geocode calls/resources in bulk
     call_latlng_raw = await geocode_postcodes_bulk([str(v) for v in cdf[call_pc].tolist()])
     call_latlng = []
-    call_durations = []
+    call_durations: List[int] = []
     call_open_days: List[List[int]] = []
     for idx, row in cdf.iterrows():
         lat, lng = call_latlng_raw[idx]
@@ -2738,6 +3053,7 @@ async def _vehicle_route_run_from_bytes(
 
     res_latlng_raw = await geocode_postcodes_bulk([str(v) for v in rdf[res_pc].tolist()])
     res_list = []
+    resource_day_spans: List[int] = []
     for idx, row in rdf.iterrows():
         name = str(row[res_name]) if res_name in row else "Resource"
         lat, lng = res_latlng_raw[idx]
@@ -2747,10 +3063,27 @@ async def _vehicle_route_run_from_bytes(
         if end_s <= start_s:
             end_s += 24 * 3600
         if not (np.isnan(lat) or np.isnan(lng)):
+            span = max(0, end_s - start_s)
+            resource_day_spans.append(span)
             res_list.append({"name": name, "lat": float(lat), "lng": float(lng), "days": days, "start": start_s, "end": end_s})
     if not res_list:
         raise HTTPException(400, "No valid resource coordinates after geocoding")
 
+    durations_sec = np.array([d for d in call_durations if d and d > 0], dtype=float)
+    typical_service_sec = float(np.median(durations_sec)) if durations_sec.size > 0 else 3600.0
+    day_spans_sec = np.array([s for s in resource_day_spans if s and s > 0], dtype=float)
+    typical_day_sec = float(np.median(day_spans_sec)) if day_spans_sec.size > 0 else 8 * 3600.0
+    total_service_minutes = float(durations_sec.sum() / 60.0) if durations_sec.size > 0 else 0.0
+    total_capacity_minutes = 0.0
+    for r, span in zip(res_list, resource_day_spans):
+        total_capacity_minutes += (span / 60.0) * max(1, len(r["days"]))
+
+    override_max_calls = _param_int("maxCallsPerDay")
+    auto_max_calls_per_day: Optional[int] = None
+    if override_max_calls is None and typical_service_sec > 0 and typical_day_sec > 0:
+        auto_max_calls_per_day = int(max(1, math.floor(typical_day_sec / typical_service_sec)))
+        auto_max_calls_per_day = max(4, min(auto_max_calls_per_day, 30))
+    MAX_PER_DAY_OVERRIDE = override_max_calls
     coords = calls[["Latitude","Longitude"]].astype(float).to_numpy()
     centers_arr = np.array([[r["lat"], r["lng"]] for r in res_list], dtype=float)
 
@@ -2797,7 +3130,7 @@ async def _vehicle_route_run_from_bytes(
         calls_by_res.setdefault(int(j), []).append(int(i))
 
     TL = _param_int("timeLimitSec", 20)
-    MAX_PER_DAY = _param_int("maxCallsPerDay")
+    MAX_PER_DAY = MAX_PER_DAY_OVERRIDE if MAX_PER_DAY_OVERRIDE is not None else auto_max_calls_per_day
     WMAX = _param_int("maxWeeks", 8)
     weeks_used = 0
     progress_made = True
@@ -2807,39 +3140,93 @@ async def _vehicle_route_run_from_bytes(
         for r_idx, idxs in calls_by_res.items():
             r = res_list[r_idx]
             depot = (r["lat"], r["lng"])
+            # Precompute once per resource: durations matrix for all its calls + depot
+            res_idxs = list(sorted(set(int(x) for x in idxs)))
+            if len(res_idxs) > 0:
+                res_coords = coords[res_idxs]
+                all_pts_res = np.vstack([res_coords, np.array([depot])])
+                dm_res_all = osrm_table_batch_duration(all_pts_res)  # shape (m+1, m+1), last is depot
+                depot_pos = len(res_idxs)
+                # Map absolute call index -> position in dm_res_all
+                pos_map = {int(abs_i): int(p) for p, abs_i in enumerate(res_idxs)}
+            else:
+                dm_res_all = None
+                depot_pos = 0
+                pos_map = {}
             for d in r["days"]:
                 elig = [i for i in idxs if i in remaining and d in calls.at[i, "OpenDays"]]
                 if not elig:
                     continue
                 sub_coords = coords[elig]
                 sub_serv = [int(calls.at[i, "DurationSec"]) for i in elig]
-                visited_rel, _dropped = vrp_single_route_with_time(
-                    sub_coords, depot, sub_serv, r["start"], r["end"],
-                    time_limit_sec=int(TL or 20), max_stops=MAX_PER_DAY
-                )
-                if not visited_rel:
-                    continue
-                all_pts = np.vstack([sub_coords, np.array([depot])])
-                dm = osrm_table_batch_duration(all_pts)
-                t = int(r["start"])
-                prev = len(sub_coords)
-                for seq, rel in enumerate(visited_rel, start=1):
-                    travel = int(dm[prev, rel])
-                    service = int(sub_serv[rel])
-                    start_t = t + travel
-                    end_t = start_t + service
-                    abs_idx = int(elig[rel])
-                    calls.at[abs_idx, "Resource"] = str(r["name"]) if r.get("name") else f"Resource {r_idx+1}"
-                    calls.at[abs_idx, "DayOfWeek"] = _DAYS[d]
-                    calls.at[abs_idx, "Sequence"] = int(seq)
-                    calls.at[abs_idx, "StartSec"] = int(start_t)
-                    calls.at[abs_idx, "EndSec"] = int(end_t)
-                    calls.at[abs_idx, "Week"] = int(weeks_used)
-                    if abs_idx in remaining:
-                        remaining.remove(abs_idx)
-                        progress_made = True
-                    t = end_t
-                    prev = rel
+                # Optional pre-cluster to compact days spatially before sequencing
+                day_groups: List[List[int]] = []
+                if VRP_PRECLUSTER and MAX_PER_DAY and int(MAX_PER_DAY) > 0:
+                    min_calls = max(1, int(math.floor(VRP_CLUSTER_MIN_RATIO * int(MAX_PER_DAY))))
+                    try:
+                        if VRP_PRECLUSTER_METHOD == "kmedoids":
+                            day_groups = _precluster_days_kmedoids(sub_coords, int(MAX_PER_DAY), VRP_CLUSTER_MIN_RATIO, H3_LAMBDA)
+                        else:
+                            routes = cvrp_days_for_territory(sub_coords, depot, min_calls, int(MAX_PER_DAY), time_sec=max(5, int(TL or 20)))
+                            day_groups = [r for r in routes if len(r) > 0]
+                    except Exception:
+                        day_groups = []
+                if not day_groups:
+                    day_groups = [list(range(len(sub_coords)))]
+                for grp in day_groups:
+                    if not grp:
+                        continue
+                    grp_coords = sub_coords[grp]
+                    grp_serv = [sub_serv[g] for g in grp]
+                    # Build a small durations matrix slice for this group from the precomputed resource matrix
+                    dm_small = None
+                    if dm_res_all is not None and len(grp_coords) > 0:
+                        grp_abs = [int(elig[g]) for g in grp]  # absolute indices in calls
+                        grp_pos = [pos_map[a] for a in grp_abs if a in pos_map]
+                        if len(grp_pos) == len(grp):
+                            m = len(grp_pos)
+                            dm_small = np.zeros((m+1, m+1), dtype=float)
+                            # Fill intra-group travel times
+                            for ii in range(m):
+                                for jj in range(m):
+                                    dm_small[ii, jj] = float(dm_res_all[grp_pos[ii], grp_pos[jj]])
+                            # Depot row/col (last index)
+                            for ii in range(m):
+                                dm_small[m, ii] = float(dm_res_all[depot_pos, grp_pos[ii]])
+                                dm_small[ii, m] = float(dm_res_all[grp_pos[ii], depot_pos])
+
+                    visited_rel, _dropped = vrp_single_route_with_time(
+                        grp_coords, depot, grp_serv, r["start"], r["end"],
+                        time_limit_sec=int(TL or 20), max_stops=int(MAX_PER_DAY) if MAX_PER_DAY else None,
+                        durations_matrix=dm_small
+                    )
+                    if not visited_rel:
+                        continue
+                    # Use the same dm_small (or compute once if missing) to compute start times
+                    if dm_small is None:
+                        all_pts = np.vstack([grp_coords, np.array([depot])])
+                        dm = osrm_table_batch_duration(all_pts)
+                    else:
+                        dm = dm_small
+                    t = int(r["start"])
+                    prev = len(grp_coords)
+                    for seq, rel in enumerate(visited_rel, start=1):
+                        travel = int(dm[prev, rel])
+                        service = int(grp_serv[rel])
+                        start_t = t + travel
+                        end_t = start_t + service
+                        abs_idx = int(elig[grp[rel]])
+                        calls.at[abs_idx, "Resource"] = str(r["name"]) if r.get("name") else f"Resource {r_idx+1}"
+                        calls.at[abs_idx, "DayOfWeek"] = _DAYS[d]
+                        calls.at[abs_idx, "Sequence"] = int(seq)
+                        calls.at[abs_idx, "StartSec"] = int(start_t)
+                        calls.at[abs_idx, "EndSec"] = int(end_t)
+                        calls.at[abs_idx, "Week"] = int(weeks_used)
+                        if abs_idx in remaining:
+                            remaining.remove(abs_idx)
+                            progress_made = True
+                        t = end_t
+                        prev = rel
     unscheduled = sorted(list(remaining))
 
     out = cdf.copy()
@@ -2873,6 +3260,7 @@ async def _vehicle_route_run_from_bytes(
         .sort_values(["Resource","Week","DayOfWeekNum"], kind="mergesort")
     )
     if len(uniq_days) > 0:
+        # Number days sequentially per Resource (do not reset per week)
         uniq_days["DayNumber"] = uniq_days.groupby("Resource").cumcount() + 1
         out = out.merge(uniq_days[["Resource","Week","DayOfWeek","DayNumber"]], on=["Resource","Week","DayOfWeek"], how="left")
     else:
@@ -2935,15 +3323,26 @@ async def _vehicle_route_run_from_bytes(
 
     scheduled_count = int(len(calls) - len(unscheduled))
     weeks_used = int(calls["Week"].max()) if scheduled_count > 0 else 0
-    message = f"Routed {scheduled_count} of {len(calls)} calls across {len(res_list)} resources in {max(1,weeks_used or 1)} week(s)."
+    weeks_planned = max(1, weeks_used or 1)
+    message = f"Routed {scheduled_count} of {len(calls)} calls across {len(res_list)} resources in {weeks_planned} week(s)."
     if unscheduled:
-        message += f" Unscheduled calls: {len(unscheduled)} (no feasible weekday/shift within {max(1,weeks_used or 1)} week(s))."
+        message += f" Unscheduled calls: {len(unscheduled)} (no feasible weekday/shift within {weeks_planned} week(s))."
+    est_weeks = None
+    if total_capacity_minutes > 0:
+        est_weeks = math.ceil(max(total_service_minutes, 0.0) / max(total_capacity_minutes, 1.0))
+        if est_weeks > weeks_planned:
+            message += f" Estimated weeks needed at current capacity: {est_weeks}."
     meta = {
         "row_count": max(0, len(rows) - 1),
         "scheduled_count": scheduled_count,
         "unscheduled_count": len(unscheduled),
         "resources": len(res_list),
         "weeks_used": weeks_used,
+        "auto_max_calls_per_day": auto_max_calls_per_day,
+        "max_calls_per_day": MAX_PER_DAY,
+        "service_minutes": total_service_minutes,
+        "capacity_minutes": total_capacity_minutes,
+        "estimated_weeks": est_weeks,
     }
     project_id = _maybe_save_project(
         headers or {},
@@ -3316,6 +3715,7 @@ async def vehicle_route(
         .sort_values(["Resource","Week","DayOfWeekNum"], kind="mergesort")
     )
     if len(uniq_days) > 0:
+        # Number days sequentially per Resource
         uniq_days["DayNumber"] = uniq_days.groupby("Resource").cumcount() + 1
         out = out.merge(uniq_days[["Resource","Week","DayOfWeek","DayNumber"]], on=["Resource","Week","DayOfWeek"], how="left")
     else:
