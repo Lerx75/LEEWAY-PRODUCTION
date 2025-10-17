@@ -24,8 +24,21 @@ import pandas as pd
 import requests
 import googlemaps
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
+
+from health import router as health_router
+from project_store import build_store_from_env
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    import duckdb as _duckdb  # type: ignore
+    _DUCKDB_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    _duckdb = None  # type: ignore
+    _DUCKDB_AVAILABLE = False
 
 try:
     from ortools.constraint_solver import pywrapcp, routing_enums_pb2  # type: ignore
@@ -34,7 +47,120 @@ except Exception:  # pragma: no cover - allow start without OR-Tools for tooling
     pywrapcp = None  # type: ignore
     routing_enums_pb2 = None  # type: ignore
     _HAS_ORTOOLS = False
-    # Duplicate route handler removed; Celery-queued version is defined earlier.
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GOOGLE_QPS = float(os.getenv("GOOGLE_QPS", "5"))
+GOOGLE_TIMEOUT = float(os.getenv("GOOGLE_TIMEOUT", "10"))
+GOOGLE_RETRY_TIMEOUT = float(os.getenv("GOOGLE_RETRY_TIMEOUT", "60"))
+
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY must be configured")
+
+try:
+    gmaps = googlemaps.Client(
+        key=GOOGLE_API_KEY,
+        queries_per_second=max(1.0, GOOGLE_QPS),
+        timeout=GOOGLE_TIMEOUT,
+        retry_timeout=GOOGLE_RETRY_TIMEOUT,
+    )
+except Exception as exc:
+    raise RuntimeError(f"Failed to initialise Google Maps client: {exc}") from exc
+
+_cors_origins_env = os.getenv("ALLOWED_ORIGINS") or os.getenv("CORS_ALLOW_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+if not _cors_origins:
+    _cors_origins = ["*"]
+if "*" in _cors_origins:
+    _cors_origins = ["*"]
+
+app = FastAPI(title="LeeWay API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Health endpoint
+app.include_router(health_router)
+
+logger = logging.getLogger("leeway.api")
+
+# Try new OR-Tools API first, then legacy
+_HAS_FLOW = False
+_mcf_mod = None
+_UPLOAD_FILE_TYPES = (UploadFile, StarletteUploadFile)
+
+_PROJECT_SERVICE_TOKEN = os.getenv("PROJECT_SERVICE_TOKEN", "").strip()
+_PROJECT_STORE = None
+_PROJECT_STORE_ERROR_LOGGED = False
+
+
+def _get_project_store():
+    global _PROJECT_STORE, _PROJECT_STORE_ERROR_LOGGED
+    if _PROJECT_STORE is None:
+        try:
+            _PROJECT_STORE = build_store_from_env()
+            _PROJECT_STORE_ERROR_LOGGED = False
+        except Exception as exc:  # pragma: no cover - configuration issue
+            if not _PROJECT_STORE_ERROR_LOGGED:
+                print(f"[WARN] Project store unavailable: {exc}")
+                _PROJECT_STORE_ERROR_LOGGED = True
+            _PROJECT_STORE = None
+    return _PROJECT_STORE
+
+
+def _get_header_value(source: Union[Request, Mapping[str, Any], None], key: str) -> Optional[str]:
+    if source is None:
+        return None
+    if isinstance(source, Request):
+        return source.headers.get(key)
+    if isinstance(source, Mapping):
+        for variant in (key, key.lower(), key.upper()):
+            if variant in source:
+                value = source[variant]
+                if isinstance(value, (list, tuple)):
+                    value = value[0] if value else None
+                if value is None:
+                    continue
+                return str(value)
+    return None
+
+
+def _service_token_valid(token: Optional[str]) -> bool:
+    if not token or not _PROJECT_SERVICE_TOKEN:
+        return False
+    try:
+        return hmac.compare_digest(str(token).strip(), _PROJECT_SERVICE_TOKEN)
+    except Exception:
+        return str(token).strip() == _PROJECT_SERVICE_TOKEN
+
+
+def _require_project_access(request: Request):
+    store = _get_project_store()
+    if store is None:
+        raise HTTPException(503, "Project storage unavailable")
+    if not _PROJECT_SERVICE_TOKEN:
+        raise HTTPException(503, "PROJECT_SERVICE_TOKEN not configured")
+    token = _get_header_value(request, "X-Service-Token")
+    if not _service_token_valid(token):
+        raise HTTPException(403, "Invalid service token")
+    user_id = (
+        _get_header_value(request, "X-User-Id")
+        or _get_header_value(request, "X-User-ID")
+        or _get_header_value(request, "X-Project-User")
+    )
+    if not user_id or not str(user_id).strip():
+        raise HTTPException(400, "X-User-Id header required")
+    return store, str(user_id).strip()
+
+
+def _maybe_save_project(
+    headers_source: Union[Request, Mapping[str, Any], None],
+    *,
+    mode: str,
+    rows: List[List[Any]],
     meta: Optional[Dict[str, Any]] = None,
     explicit_name: Optional[str] = None,
 ) -> Optional[int]:
@@ -109,14 +235,14 @@ async def vehicle_route(request: Request):
         pass
     calls_file = form.get("callsFile")
     resources_file = form.get("resourcesFile")
-    if not isinstance(calls_file, (UploadFile, StarletteUploadFile)):
+    if not isinstance(calls_file, _UPLOAD_FILE_TYPES):
         raise HTTPException(400, "callsFile upload is required")
-    if not isinstance(resources_file, (UploadFile, StarletteUploadFile)):
+    if not isinstance(resources_file, _UPLOAD_FILE_TYPES):
         raise HTTPException(400, "resourcesFile upload is required")
 
     params: Dict[str, Any] = {}
     for key, value in form.items():
-        if isinstance(value, (UploadFile, StarletteUploadFile)):
+        if isinstance(value, _UPLOAD_FILE_TYPES):
             continue
         params[key] = value if isinstance(value, str) else ("" if value is None else str(value))
 
@@ -2713,7 +2839,7 @@ async def cluster_only(
         svc_local = service_seconds[idxs]
         depot_lat_lng = _choose_depot(terr_coords)
         target_minutes = _estimate_target_minutes(svc_local, maxCalls)
-    target_minutes_acc.append(float(target_minutes))
+        target_minutes_acc.append(float(target_minutes))
         routes: List[List[int]]
         stats: Optional[Dict[str, Any]] = None
         if len(terr_coords) == 1:
