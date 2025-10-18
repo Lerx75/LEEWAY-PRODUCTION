@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo, useTransition, memo } from 'react';
-import dynamic from 'next/dynamic';
 import * as h3 from 'h3-js';
+import dynamic from 'next/dynamic';
+import { memo, useEffect, useMemo, useState, useTransition } from 'react';
 import * as XLSX from 'xlsx';
 import '../globals.css';
 
@@ -265,6 +265,12 @@ export default function AppMain() {
       const selectedFile = e.target.files[0];
       setFile(selectedFile);
       setFileName(selectedFile.name);
+      setCallHeaders([]);
+      setMapCallName('');
+      setMapCallPC('');
+      setMapCallDur('');
+      setMapCallDays('');
+      setMapGroupCol('');
       // Parse headers for mapping (for Vehicle Routing)
       (async () => {
         try {
@@ -293,10 +299,25 @@ export default function AppMain() {
             const cand = headersNorm.find(h => /(days|weekday|open|availability)/.test(h.key));
             if (cand) setMapCallDays(cand.raw);
           }
+          const groupCand = (() => {
+            const groupPattern = /(territory|territories|territoryname|territoryid|territorycode|territorydescription|territorydesc|group|grouping|groupname|cluster|route|routename|team|teamname|teamid|teamcode|worker|workernumber|resource|resourcegroup|resourcename|engineer|rep|salesrep|salesperson|salespersonname|driver|technician|tech|agent|advisor|advocate|area|zone|region|district|division|market|branch|pod|crew|crewname|manager|accountmanager|owner|day|dayname|weekday|weekpart|cell|subteam)/;
+            return headersNorm.find(h => groupPattern.test(h.key));
+          })();
+          setMapGroupCol(groupCand ? groupCand.raw : '');
         } catch (err) {
           // ignore parse errors; mapping can be typed
         }
       })();
+    }
+    else {
+      setFile(null);
+      setFileName('');
+      setCallHeaders([]);
+      setMapCallName('');
+      setMapCallPC('');
+      setMapCallDur('');
+      setMapCallDays('');
+      setMapGroupCol('');
     }
   };
   const handleResourcesFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -399,32 +420,28 @@ export default function AppMain() {
     }
     const fd = new FormData();
     if (mode === 'route') {
-  // In route mode, the primary file is the main sheet with Territory/Group.
-  // We also support a separate calls file (same as main here), so pass as 'callsFile' to leverage backend merge.
-  fd.append('file', file!);
-  fd.append('callsFile', file!);
-    if (mapCallName) fd.append('callsNameCol', mapCallName);
-  if (mapCallDur) fd.append('callsDurationCol', mapCallDur);
-  if (mapCallPC) fd.append('callsPostcodeCol', mapCallPC);
-  if (mapCallDays) fd.append('callsDaysCol', mapCallDays);
-  if (mapGroupCol) fd.append('groupCol', mapGroupCol);
+      // In route mode the primary file carries the grouping column used downstream.
+      fd.append('file', file!);
+      fd.append('callsFile', file!);
+      if (mapCallName) fd.append('callsNameCol', mapCallName);
+      if (mapCallDur) fd.append('callsDurationCol', mapCallDur);
+      if (mapCallPC) fd.append('callsPostcodeCol', mapCallPC);
+      if (mapCallDays) fd.append('callsDaysCol', mapCallDays);
       fd.append('workDayMinutes', String(workDayMin));
       if (resourcesFile) fd.append('resourcesFile', resourcesFile);
-  // Optional resource mappings if headers were parsed
-  if (mapResName) fd.append('resNameCol', mapResName);
-  if (mapResPC) fd.append('resPostcodeCol', mapResPC);
-  if (mapResDays) fd.append('resDaysCol', mapResDays);
-  if (mapResStart) fd.append('resStartCol', mapResStart);
-  if (mapResEnd) fd.append('resEndCol', mapResEnd);
-  // Allow multi-week spillover for limited shifts
-  fd.append('maxWeeks', '8');
-  // Speed knobs
+      if (mapResName) fd.append('resNameCol', mapResName);
+      if (mapResPC) fd.append('resPostcodeCol', mapResPC);
+      if (mapResDays) fd.append('resDaysCol', mapResDays);
+      if (mapResStart) fd.append('resStartCol', mapResStart);
+      if (mapResEnd) fd.append('resEndCol', mapResEnd);
+      fd.append('maxWeeks', '8');
     } else {
       fd.append('file', file!);
       fd.append('minCalls', String(minC));
       fd.append('maxCalls', String(maxC));
     }
-  if (mode === 'plan') {
+    if (mapGroupCol) fd.append('groupCol', mapGroupCol);
+    if (mode === 'plan') {
       fd.append('numTerritories', String(numTerritories));
       if (resourcesFile) {
         fd.append('resourcesFile', resourcesFile);
@@ -1220,6 +1237,17 @@ export default function AppMain() {
               <input type="file" onChange={handleFileChange} accept=".xlsx,.xls" style={{marginBottom: 12}} />
             </div>
           )}
+          {mode !== 'route' && callHeaders.length > 0 && (
+            <div className="card">
+              <label style={{display:'block', fontWeight:600, marginBottom:6}}>Existing Territory/Group Column (optional) <Help text="If your sheet already assigns calls to reps/territories, pick that column so we keep days separate per group." /></label>
+              <select value={mapGroupCol} onChange={e => setMapGroupCol(e.target.value)} style={{width:'100%'}}>
+                <option value="">None</option>
+                {callHeaders.map(h => (
+                  <option key={h} value={h}>{h}</option>
+                ))}
+              </select>
+            </div>
+          )}
           {mode !== 'route' && (
             <>
               <div className="card">
@@ -1304,6 +1332,17 @@ export default function AppMain() {
                       </select>
                     ) : (
           <input placeholder="Days (optional)" value={mapCallDays} onChange={e=>setMapCallDays(e.target.value)} style={{width:'100%'}} />
+                    )}
+                  </div>
+                  <div>
+                    <label style={{display:'block', fontSize:12, color:'#fff'}}>Group/Territory (optional)</label>
+                    {callHeaders.length ? (
+          <select value={mapGroupCol} onChange={e=>setMapGroupCol(e.target.value)} style={{width:'100%'}}>
+                        <option value="">None</option>
+                        {callHeaders.map(h => <option key={h} value={h}>{h}</option>)}
+                      </select>
+                    ) : (
+          <input placeholder="Group/Territory" value={mapGroupCol} onChange={e=>setMapGroupCol(e.target.value)} style={{width:'100%'}} />
                     )}
                   </div>
                 </div>

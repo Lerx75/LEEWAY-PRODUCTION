@@ -372,7 +372,8 @@ except Exception:
 
 # --- Tweaked parameters for tighter clusters and less overlap ---
 H3_RES = int(os.getenv("H3_RES", "8"))  # smaller hex size for more compact clusters
-H3_LAMBDA = float(os.getenv("H3_LAMBDA", "40000"))  # stronger penalty for splitting hexes
+# Increase default contiguity penalty to reduce scattered day clusters
+H3_LAMBDA = float(os.getenv("H3_LAMBDA", "60000"))  # stronger penalty for splitting hexes
 FLOW_ALPHA = float(os.getenv("FLOW_ALPHA", "1.6"))
 FLOW_GAMMA = float(os.getenv("FLOW_GAMMA", "6.0"))  # even stronger weight for distance
 USE_CELL_FLOW = int(os.getenv("USE_CELL_FLOW", "1"))
@@ -394,25 +395,27 @@ VRP_CLUSTER_MIN_RATIO = float(os.getenv("VRP_CLUSTER_MIN_RATIO", "0.8"))  # min_
 VRP_PRECLUSTER_METHOD = (os.getenv("VRP_PRECLUSTER_METHOD", "kmedoids").strip().lower() or "kmedoids")
 VRP_PRECLUSTER_OSRM_MAX_N = int(os.getenv("VRP_PRECLUSTER_OSRM_MAX_N", "80"))  # above this, avoid OSRM in k-medoids
 VRP_KMEDOIDS_OSRM_CENTERS = int(os.getenv("VRP_KMEDOIDS_OSRM_CENTERS", "1"))  # if 1, use OSRM only for coords->centers matrix
-VRP_ROUTE_TIME_LIMIT_SEC = int(os.getenv("VRP_ROUTE_TIME_LIMIT_SEC", "15"))  # per-route solver time limit
+VRP_ROUTE_TIME_LIMIT_SEC = int(os.getenv("VRP_ROUTE_TIME_LIMIT_SEC", "10"))  # per-route solver time limit
 VRP_META = (os.getenv("VRP_META", "gls").strip().lower() or "gls")  # gls|sa|greedy
 VRP_FIRST = (os.getenv("VRP_FIRST", "parallel_cheapest_insertion").strip().lower() or "parallel_cheapest_insertion")
-VRP_MS_TRIES = max(1, int(os.getenv("VRP_MS_TRIES", "3")))  # multi-start attempts per route/territory
+VRP_MS_TRIES = max(1, int(os.getenv("VRP_MS_TRIES", "2")))  # multi-start attempts per route/territory
 VRP_MS_TOTAL_SEC = max(0, int(os.getenv("VRP_MS_TOTAL_SEC", "0")))  # 0 = disabled; otherwise cap total search seconds across tries
 VRP_NUM_WORKERS = max(1, int(os.getenv("VRP_NUM_WORKERS", str(os.cpu_count() or 1))))
 VRP_DROP_PENALTY = max(1, int(os.getenv("VRP_DROP_PENALTY", "10000000")))  # discourage dropping
 VRP_LNS_TIME_SEC = max(0, int(os.getenv("VRP_LNS_TIME_SEC", "1")))  # 0 to disable LNS; small positive for mild improvement
 
 CLUSTER_OSRM_MAX_N = int(os.getenv("CLUSTER_OSRM_MAX_N", "140"))
+CLUSTER_PRECLUSTER_FIRST = int(os.getenv("CLUSTER_PRECLUSTER_FIRST", "1"))
 CLUSTER_DEFAULT_SERVICE_MIN = float(os.getenv("CLUSTER_DEFAULT_SERVICE_MIN", "45"))
 CLUSTER_SOLVER_TIME_SEC = int(os.getenv("CLUSTER_SOLVER_TIME_SEC", "20"))
 CLUSTER_BASE_DAY_MINUTES = float(os.getenv("CLUSTER_BASE_DAY_MINUTES", "240"))
 CLUSTER_DURATION_PENALTY = float(os.getenv("CLUSTER_DURATION_PENALTY", "12.0"))
 CLUSTER_SA_POLISH = int(os.getenv("CLUSTER_SA_POLISH", "1"))
 CLUSTER_SA_MAX_N = int(os.getenv("CLUSTER_SA_MAX_N", "180"))
-CLUSTER_SA_ITERS = int(os.getenv("CLUSTER_SA_ITERS", "400"))
-CLUSTER_SA_INIT_TEMP = float(os.getenv("CLUSTER_SA_INIT_TEMP", "60"))
-CLUSTER_SA_COOLING = float(os.getenv("CLUSTER_SA_COOLING", "0.995"))
+# More polishing by default to encourage cross-day swaps when beneficial
+CLUSTER_SA_ITERS = int(os.getenv("CLUSTER_SA_ITERS", "600"))
+CLUSTER_SA_INIT_TEMP = float(os.getenv("CLUSTER_SA_INIT_TEMP", "80"))
+CLUSTER_SA_COOLING = float(os.getenv("CLUSTER_SA_COOLING", "0.996"))
 
 _OSRM_BASE_RAW = (
     os.getenv("OSRM_BASE")
@@ -1444,12 +1447,12 @@ def _sa_polish_day_routes(
         if temp < 1e-3:
             break
         new_solution: Optional[List[List[int]]] = None
-        for _ in range(12):
+        for _ in range(16):
             if len(current) < 2:
                 break
             kind = random.random()
             cand = [day[:] for day in current]
-            if kind < 0.6:
+            if kind < 0.5:
                 src_idx = random.randrange(len(cand))
                 dst_idx = random.randrange(len(cand))
                 if src_idx == dst_idx:
@@ -1460,10 +1463,24 @@ def _sa_polish_day_routes(
                     continue
                 if not valid_move(len(src), len(dst)):
                     continue
+                # Block move: move a node and optionally its nearest neighbor by duration_matrix to the same day
                 node = random.choice(src)
-                src.remove(node)
-                dst.append(node)
-                dst.sort()
+                block = [node]
+                # try to add a close neighbor from the same src day
+                if len(src) >= 2:
+                    try:
+                        nearest = min([i for i in src if i != node], key=lambda j: float(duration_matrix[node, j]))
+                        block.append(nearest)
+                    except Exception:
+                        pass
+                # respect max_calls when moving a block
+                if max_calls > 0 and len(dst) + len(block) > max_calls:
+                    continue
+                for b in block:
+                    if b in src:
+                        src.remove(b)
+                        dst.append(b)
+                dst.sort(); src.sort()
                 cand[src_idx] = src
                 cand[dst_idx] = dst
                 new_solution = cand
@@ -1511,6 +1528,43 @@ def _sa_polish_day_routes(
                 best = [day[:] for day in new_solution]
                 best_cost = neighbor_cost
         temp *= cooling
+    # Optional bounded greedy pair swaps (lightweight local improvement)
+    def try_swap_once(sol: List[List[int]]) -> Optional[List[List[int]]]:
+        n_days = len(sol)
+        if n_days < 2:
+            return None
+        base_cost = routes_cost(sol)
+        for a_idx in range(n_days):
+            for b_idx in range(a_idx + 1, n_days):
+                a = sol[a_idx]
+                b = sol[b_idx]
+                if not a or not b:
+                    continue
+                # sample a few candidates to keep it fast
+                sample_a = a if len(a) <= 6 else random.sample(a, 6)
+                sample_b = b if len(b) <= 6 else random.sample(b, 6)
+                for na in sample_a:
+                    for nb in sample_b:
+                        # capacity constraints unaffected by 1-1 swap
+                        cand = [day[:] for day in sol]
+                        ca = cand[a_idx]; cb = cand[b_idx]
+                        try:
+                            ca[ca.index(na)] = nb
+                            cb[cb.index(nb)] = na
+                        except Exception:
+                            continue
+                        ca.sort(); cb.sort()
+                        cand[a_idx] = ca; cand[b_idx] = cb
+                        new_cost = routes_cost(cand)
+                        if new_cost + 1e-9 < base_cost:
+                            return cand
+        return None
+
+    for _ in range(3):
+        cand = try_swap_once(best)
+        if cand is None:
+            break
+        best = cand
     return best
 
 
@@ -2944,7 +2998,60 @@ async def cluster_only(
     if groupCol and groupCol.lower() in [c.lower() for c in geo.columns]:
         group_col = [c for c in geo.columns if c.lower() == groupCol.lower()][0]
     else:
-        candidates = ["territory", "group", "cluster", "day", "route", "team"]
+        candidates = [
+            "territory",
+            "territories",
+            "territoryname",
+            "territoryid",
+            "territorycode",
+            "territorydescription",
+            "territorydesc",
+            "group",
+            "grouping",
+            "groupname",
+            "cluster",
+            "route",
+            "routename",
+            "team",
+            "teamname",
+            "teamid",
+            "teamcode",
+            "worker",
+            "workernumber",
+            "resource",
+            "resourcename",
+            "resourcegroup",
+            "rep",
+            "salesrep",
+            "salesperson",
+            "salespersonname",
+            "driver",
+            "engineer",
+            "technician",
+            "tech",
+            "agent",
+            "advisor",
+            "advocate",
+            "area",
+            "zone",
+            "region",
+            "district",
+            "division",
+            "market",
+            "branch",
+            "pod",
+            "crew",
+            "crewname",
+            "manager",
+            "accountmanager",
+            "owner",
+            "day",
+            "dayname",
+            "weekday",
+            "weekpart",
+            "cell",
+            "subteam",
+        ]
         lower_cols = {c.lower(): c for c in geo.columns}
         for cand in candidates:
             if cand in lower_cols:
@@ -2966,6 +3073,7 @@ async def cluster_only(
     target_minutes_acc: List[float] = []
     fallback_notes: List[str] = []
     sa_polished_groups = 0
+    used_precluster = False
 
     def _choose_depot(points: np.ndarray) -> Tuple[float, float]:
         if len(points) == 0:
@@ -2987,6 +3095,27 @@ async def cluster_only(
             return
         terr_coords = coords[idxs]
         svc_local = service_seconds[idxs]
+
+        # Precluster into geographically compact day-sized groups when enabled
+        if int(CLUSTER_PRECLUSTER_FIRST) and int(maxCalls) > 0 and len(terr_coords) > 1:
+            nonlocal used_precluster
+            try:
+                min_ratio = 0.0
+                try:
+                    if int(maxCalls) > 0:
+                        min_ratio = max(0.0, min(1.0, float(minCalls) / float(maxCalls)))
+                except Exception:
+                    min_ratio = 0.0
+                day_groups = _precluster_days_kmedoids(terr_coords, int(maxCalls), float(min_ratio), float(H3_LAMBDA))
+                day_counter = 1
+                for g in day_groups:
+                    for rel_idx in g:
+                        geo.at[int(idxs[int(rel_idx)]), "Day"] = f"Day {day_counter}"
+                    day_counter += 1
+                used_precluster = True
+                return
+            except Exception as exc:
+                fallback_notes.append(f"{note_key}: precluster failed ({exc}); falling back to VRP split")
         depot_lat_lng = _choose_depot(terr_coords)
         target_minutes = _estimate_target_minutes(svc_local, maxCalls)
         target_minutes_acc.append(float(target_minutes))
@@ -3101,6 +3230,8 @@ async def cluster_only(
         "default_service_minutes": CLUSTER_DEFAULT_SERVICE_MIN if service_col is None else None,
         "median_target_minutes": float(np.median(target_minutes_acc)) if target_minutes_acc else None,
     }
+    if used_precluster:
+        meta["precluster_used"] = True
     if sa_polished_groups:
         meta["sa_polished_groups"] = int(sa_polished_groups)
     if fallback_notes:
@@ -4374,7 +4505,65 @@ async def mode_routes(
     if groupCol and groupCol.lower() in [c.lower() for c in df.columns]:
         terr_col = [c for c in df.columns if c.lower() == groupCol.lower()][0]
     else:
-        terr_col = next((c for c in df.columns if c in ("territory","group","cluster","route","team")), None)
+        terr_col = next((
+            c
+            for c in df.columns
+            if c
+            in (
+                "territory",
+                "territories",
+                "territoryname",
+                "territoryid",
+                "territorycode",
+                "territorydescription",
+                "territorydesc",
+                "group",
+                "grouping",
+                "groupname",
+                "cluster",
+                "route",
+                "routename",
+                "team",
+                "teamname",
+                "teamid",
+                "teamcode",
+                "worker",
+                "workernumber",
+                "resource",
+                "resourcename",
+                "resourcegroup",
+                "rep",
+                "salesrep",
+                "salesperson",
+                "salespersonname",
+                "driver",
+                "engineer",
+                "technician",
+                "tech",
+                "agent",
+                "advisor",
+                "advocate",
+                "area",
+                "zone",
+                "region",
+                "district",
+                "division",
+                "market",
+                "branch",
+                "pod",
+                "crew",
+                "crewname",
+                "manager",
+                "accountmanager",
+                "owner",
+                "day",
+                "dayname",
+                "weekday",
+                "weekpart",
+                "cell",
+                "subteam",
+            )
+        ), None)
     # If no territory column, we'll route directly using resources (if provided). Only error if neither is available.
     # If a separate calls file is provided, we'll source durations from it; otherwise use this sheet
     dur_col = None

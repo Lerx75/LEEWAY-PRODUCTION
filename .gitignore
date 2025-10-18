@@ -155,3 +155,10 @@ frontend/.turbo/
 frontend/dist/
 frontend/build/
 opt/
+
+# Env files (explicit project paths)
+backend/.env
+backend/.env.*
+infra/.env
+infra/.env.*
+frontend/.env.local

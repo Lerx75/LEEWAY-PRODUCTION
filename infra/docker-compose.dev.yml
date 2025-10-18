@@ -3,13 +3,11 @@ name: leeway-dev
 services:
   redis:
     image: redis:7-alpine
-    container_name: leeway-redis
     ports:
       - "6379:6379"
 
   backend:
     image: python:3.11-slim
-    container_name: leeway-backend
     working_dir: /app
     volumes:
       - ../backend:/app
@@ -31,7 +29,6 @@ services:
 
   worker:
     image: python:3.11-slim
-    container_name: leeway-worker
     working_dir: /app
     volumes:
       - ../backend:/app
@@ -48,7 +45,6 @@ services:
 
   frontend:
     image: node:20-bullseye-slim
-    container_name: leeway-frontend
     working_dir: /web
     volumes:
       - ../frontend:/web

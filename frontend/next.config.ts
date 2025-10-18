@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const csp = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:" ,
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://static.cloudflareinsights.com" ,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: https://*.tile.openstreetmap.org",
   "font-src 'self' data:",
