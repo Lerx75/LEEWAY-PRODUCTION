@@ -10,12 +10,15 @@ sudo apt-get update && sudo apt-get install -y docker.io docker-compose-plugin
 docker network create leeway-net || true
 ```
 
-2) Copy your env file based on the template in this repo:
+2) Ensure your production env file exists at `infra/.env.production` with real values:
 ```
-cp infra/.env.prod.example infra/.env.prod
-# Edit infra/.env.prod and set real secrets + OSRM_URL
 # REQUIRED: Set PROJECT_SERVICE_TOKEN to a strong random value. The frontend will forward this via X-Service-Token.
+# Include Google API key, OSRM config, Redis/Celery URLs, CORS/frontend URLs, and other runtime settings.
 ```
+
+Optional: tuning flags without secrets can live in `infra/clustering.flags`, which is already wired into the compose
+for backend and worker. You can edit `clustering.flags` to control clustering behavior (e.g., H3_LAMBDA, refinement)
+without touching secrets. The compose will load both `.env.production` and `clustering.flags`.
 
 ## Build and run
 
@@ -40,18 +43,20 @@ docker compose -f infra/docker-compose.prod.yml pull
 docker compose -f infra/docker-compose.prod.yml up -d --build backend worker frontend
 ```
 
+If the stack was cloned fresh, make sure `infra/.env.production` is present before running the command above.
+
 ## Troubleshooting
 
 - If you already run OSRM separately, comment out the `osrm-routing` service in the compose file.
 - Ensure all services are on the `leeway-net` network (compose does this via default).
-- If backend cannot reach OSRM by name, set `OSRM_URL=http://<droplet-ip>:5000` in `.env.prod`.
+- If backend cannot reach OSRM by name, set `OSRM_URL=http://<droplet-ip>:5000` in `.env.production`.
 - Backend and worker share `/srv/data` via a named Docker volume `leeway-data` defined in compose. If you previously ran containers without this, remove and recreate to attach the volume.
 - After code changes to `backend/app.py`, rebuild BOTH backend and worker images so the worker picks up changes (IndentationError or stale code can occur otherwise):
 	- `docker compose -f infra/docker-compose.prod.yml up -d --build backend worker`
 
 ## Production env checklist (to avoid "fetch failed")
 
-Create `infra/.env.prod` from `infra/.env.prod.example` and ensure:
+Ensure `infra/.env.production` includes:
 
 - `PROJECT_SERVICE_TOKEN` is set to a strong random value. Frontend forwards this via `X-Service-Token` and backend validates it.
 - Set either `NEXT_PUBLIC_API_URL` (preferred) or `NEXT_PUBLIC_API_BASE` to your public backend URL, e.g. `https://api.leewayroute.com`.

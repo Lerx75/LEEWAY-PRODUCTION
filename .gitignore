@@ -161,5 +161,4 @@ backend/.env
 backend/.env.*
 infra/.env
 infra/.env.*
-!infra/.env.prod.example
 frontend/.env.local
