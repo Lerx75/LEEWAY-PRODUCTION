@@ -416,6 +416,8 @@ CLUSTER_SA_MAX_N = int(os.getenv("CLUSTER_SA_MAX_N", "180"))
 CLUSTER_SA_ITERS = int(os.getenv("CLUSTER_SA_ITERS", "600"))
 CLUSTER_SA_INIT_TEMP = float(os.getenv("CLUSTER_SA_INIT_TEMP", "80"))
 CLUSTER_SA_COOLING = float(os.getenv("CLUSTER_SA_COOLING", "0.996"))
+CLUSTER_REFINE_ITERS = int(os.getenv("CLUSTER_REFINE_ITERS", "2"))
+CLUSTER_REFINE_IMPROVE_RATIO = float(os.getenv("CLUSTER_REFINE_IMPROVE_RATIO", "1.25"))
 
 _OSRM_BASE_RAW = (
     os.getenv("OSRM_BASE")
@@ -908,6 +910,93 @@ def _precluster_days_kmedoids(
     for i, a in enumerate(assign):
         groups[int(a)].append(int(i))
     return [g for g in groups if g]
+
+
+def _refine_day_groups_compact(
+    coords: np.ndarray,
+    groups: List[List[int]],
+    min_calls: int,
+    max_calls: int,
+    improve_ratio: float = CLUSTER_REFINE_IMPROVE_RATIO,
+    iters: int = CLUSTER_REFINE_ITERS,
+) -> List[List[int]]:
+    """Tighten preclustered day groups by greedily moving obvious outliers to nearer groups
+    while respecting min/max sizes. Uses haversine distances to medoid-like centers.
+    """
+    if not groups:
+        return groups
+    n = len(coords)
+    # assignment array 0..k-1
+    k = len(groups)
+    assign = -np.ones(n, dtype=int)
+    for gi, g in enumerate(groups):
+        for idx in g:
+            if 0 <= int(idx) < n:
+                assign[int(idx)] = gi
+    if np.any(assign < 0):
+        # ignore bad entries
+        valid = np.where(assign >= 0)[0]
+        if len(valid) == 0:
+            return groups
+    # Helper to compute medoid centers and distance-to-centers
+    def centers_and_D():
+        centers_idx: List[int] = []
+        for gi in range(k):
+            members = np.where(assign == gi)[0]
+            if len(members) == 0:
+                centers_idx.append(-1)
+                continue
+            sub = coords[members]
+            # medoid by haversine
+            D = _haversine_matrix_full(sub)
+            med_rel = int(np.argmin(D.sum(axis=0)))
+            centers_idx.append(int(members[med_rel]))
+        centers = np.array([[coords[i,0], coords[i,1]] if i >= 0 else [np.nan, np.nan] for i in centers_idx])
+        # Distances to centers (meters) via haversine
+        valid_centers = centers[~np.isnan(centers[:,0])]
+        if len(valid_centers) == 0:
+            return centers, np.zeros((n, k), dtype=float)
+        D_to_centers = _haversine_matrix_between(coords, centers)
+        return centers, D_to_centers
+
+    sizes = [int(np.sum(assign == gi)) for gi in range(k)]
+    centers, D2C = centers_and_D()
+    improve_ratio = max(1.0, float(improve_ratio))
+    for _ in range(max(0, int(iters))):
+        changed = False
+        # Consider points farthest from their current center first
+        order = np.argsort([D2C[i, assign[i]] if assign[i] >= 0 else 0.0 for i in range(n)])[::-1]
+        for i in order:
+            gi = int(assign[i])
+            if gi < 0:
+                continue
+            cur_cost = float(D2C[i, gi])
+            # best alternative center
+            best_j = gi
+            best_cost = cur_cost
+            for j in range(k):
+                if j == gi:
+                    continue
+                c = float(D2C[i, j])
+                if c < best_cost:
+                    best_cost = c; best_j = j
+            # Move if a lot closer and capacity allows and won't violate min on donor
+            if best_j != gi and best_cost * improve_ratio < cur_cost:
+                if (max_calls <= 0 or sizes[best_j] + 1 <= max_calls) and (min_calls <= 0 or sizes[gi] - 1 >= min_calls):
+                    assign[i] = best_j
+                    sizes[gi] -= 1; sizes[best_j] += 1
+                    changed = True
+        if changed:
+            centers, D2C = centers_and_D()
+        else:
+            break
+    # Rebuild groups
+    new_groups: List[List[int]] = [[] for _ in range(k)]
+    for i in range(n):
+        gi = int(assign[i])
+        if gi >= 0:
+            new_groups[gi].append(int(i))
+    return [g for g in new_groups if g]
 
 
 # ----------------------------
@@ -2682,6 +2771,10 @@ async def territory_plan(
     df["Latitude"] = latitudes
     df["Longitude"] = longitudes
     failed_rows = df.iloc[failed_indices].copy() if failed_indices else []
+    # Build geo with valid coordinates
+    geo = df.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
+    if geo.empty:
+        raise HTTPException(400, "No valid coordinates after geocoding.")
 
     # Select group column if provided
     group_col = None
@@ -2817,7 +2910,13 @@ async def territory_plan(
         # plan per group (keeps user logical splits)
         terr_counter_offset = 0
         for group_val in geo[group_col].unique():
-            mask = (geo[group_col] == group_val).to_numpy()
+            # Handle NA/None group values explicitly to avoid ambiguous NA
+            if pd.isna(group_val):
+                mask = geo[group_col].isna().to_numpy()
+                group_note = "group <NA>"
+            else:
+                mask = geo[group_col].eq(group_val).fillna(False).to_numpy(dtype=bool)
+                group_note = f"group {group_val}"
             idxs = np.where(mask)[0]
             if len(idxs) == 0:
                 continue
@@ -2949,6 +3048,7 @@ async def cluster_only(
     minCalls: int = Form(...),
     maxCalls: int = Form(...),
     groupCol: Optional[str] = Form(None),
+    splitByGroup: Optional[str] = Form(None),
     dayTimeLimitSec: Optional[int] = Form(30),
     projectName: Optional[str] = Form(None)
 ):
@@ -2993,70 +3093,12 @@ async def cluster_only(
 
     service_seconds = geo["_service_seconds"].to_numpy(dtype=float)
 
-    # Resolve group column: use provided or auto-detect; if none, treat all rows as one group
+    # Resolve grouping: cluster-only ignores territories by default.
+    # Only split by group if the caller explicitly asks via splitByGroup=1 and provides a valid groupCol.
     group_col = None
-    if groupCol and groupCol.lower() in [c.lower() for c in geo.columns]:
+    _respect_group = str(splitByGroup or "").strip().lower() in ("1", "true", "yes", "on")
+    if _respect_group and groupCol and groupCol.lower() in [c.lower() for c in geo.columns]:
         group_col = [c for c in geo.columns if c.lower() == groupCol.lower()][0]
-    else:
-        candidates = [
-            "territory",
-            "territories",
-            "territoryname",
-            "territoryid",
-            "territorycode",
-            "territorydescription",
-            "territorydesc",
-            "group",
-            "grouping",
-            "groupname",
-            "cluster",
-            "route",
-            "routename",
-            "team",
-            "teamname",
-            "teamid",
-            "teamcode",
-            "worker",
-            "workernumber",
-            "resource",
-            "resourcename",
-            "resourcegroup",
-            "rep",
-            "salesrep",
-            "salesperson",
-            "salespersonname",
-            "driver",
-            "engineer",
-            "technician",
-            "tech",
-            "agent",
-            "advisor",
-            "advocate",
-            "area",
-            "zone",
-            "region",
-            "district",
-            "division",
-            "market",
-            "branch",
-            "pod",
-            "crew",
-            "crewname",
-            "manager",
-            "accountmanager",
-            "owner",
-            "day",
-            "dayname",
-            "weekday",
-            "weekpart",
-            "cell",
-            "subteam",
-        ]
-        lower_cols = {c.lower(): c for c in geo.columns}
-        for cand in candidates:
-            if cand in lower_cols:
-                group_col = lower_cols[cand]
-                break
 
     minCalls = max(0, int(minCalls))
     maxCalls = int(maxCalls)
@@ -3107,6 +3149,15 @@ async def cluster_only(
                 except Exception:
                     min_ratio = 0.0
                 day_groups = _precluster_days_kmedoids(terr_coords, int(maxCalls), float(min_ratio), float(H3_LAMBDA))
+                # Optional refinement to pull in outliers while respecting caps
+                try:
+                    day_groups = _refine_day_groups_compact(
+                        terr_coords, day_groups, int(minCalls), int(maxCalls),
+                        improve_ratio=float(CLUSTER_REFINE_IMPROVE_RATIO),
+                        iters=int(CLUSTER_REFINE_ITERS)
+                    )
+                except Exception:
+                    pass
                 day_counter = 1
                 for g in day_groups:
                     for rel_idx in g:
@@ -3187,9 +3238,15 @@ async def cluster_only(
 
     if group_col:
         for group_val in geo[group_col].unique():
-            mask = (geo[group_col] == group_val).to_numpy()
+            # Build a safe boolean mask that handles pandas NA values explicitly
+            if pd.isna(group_val):
+                mask = geo[group_col].isna().to_numpy()
+                note = "group <NA>"
+            else:
+                mask = geo[group_col].eq(group_val).fillna(False).to_numpy(dtype=bool)
+                note = f"group {group_val}"
             idxs = np.where(mask)[0]
-            _cluster_indices(idxs, f"group {group_val}")
+            _cluster_indices(idxs, note)
     else:
         _cluster_indices(np.arange(len(geo)), "all")
 
@@ -3210,13 +3267,37 @@ async def cluster_only(
         cts = geo.groupby(["Day"]).size().rename("CallsPerDay").reset_index()
         geo = geo.merge(cts, on=["Day"], how="left")
 
+    # Disambiguate day labels across groups by providing a global unique id and a combined key
+    if group_col:
+        try:
+            # Unique (group, Day) pairs in first-seen order
+            uniq_pairs = (
+                geo[[group_col, "Day"]]
+                .dropna(subset=["Day"])  # keep NA groups; Day must be present
+                .drop_duplicates(keep="first")
+            )
+            # Build a stable key and factorize to 1..K
+            key_series = uniq_pairs[group_col].astype(str).fillna("<NA>") + "||" + uniq_pairs["Day"].astype(str)
+            codes, _uniques = pd.factorize(key_series, sort=False)
+            uniq_pairs = uniq_pairs.assign(_GlobalDayNumber=(codes + 1))
+            geo = geo.merge(uniq_pairs.assign(_k=key_series.values)[[group_col, "Day", "_GlobalDayNumber"]], on=[group_col, "Day"], how="left")
+            geo.rename(columns={"_GlobalDayNumber": "GlobalDayNumber"}, inplace=True)
+            geo["DayKey"] = geo[group_col].astype(str).fillna("<NA>") + " - " + geo["Day"].astype(str)
+        except Exception:
+            # Fallback: mirror DayNumber
+            geo["GlobalDayNumber"] = geo["DayNumber"]
+            geo["DayKey"] = geo["Day"].astype(str)
+    else:
+        geo["GlobalDayNumber"] = geo["DayNumber"]
+        geo["DayKey"] = geo["Day"].astype(str)
+
     days_msg = int(len({d for d in geo["Day"] if d}))
 
     geo = geo.drop(columns=["_service_seconds"], errors="ignore")
 
     # Prepare output rows with Day columns
-    outCols = [c for c in geo.columns if c not in ("Latitude", "Longitude", "Day", "DayNumber", "CallsPerDay")]
-    excelCols = ["Day", "DayNumber", "CallsPerDay", "Latitude", "Longitude"] + outCols
+    outCols = [c for c in geo.columns if c not in ("Latitude", "Longitude", "Day", "DayNumber", "GlobalDayNumber", "DayKey", "CallsPerDay")]
+    excelCols = ["Day", "DayNumber", "GlobalDayNumber", "DayKey", "CallsPerDay", "Latitude", "Longitude"] + outCols
     geo_excel = geo[excelCols].astype("object").where(pd.notna(geo[excelCols]), "").astype(str)
     rows = [excelCols] + geo_excel.values.tolist()
 
@@ -3224,6 +3305,8 @@ async def cluster_only(
         "row_count": max(0, len(rows) - 1),
         "days": int(days_msg),
         "grouped": bool(group_col),
+        "group_col_used": str(group_col) if group_col else None,
+        "split_by_group": bool(group_col),
         "failed_geocodes": len(failed_rows),
         "solver_counts": solver_counts,
         "service_column": service_col,
