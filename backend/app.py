@@ -3380,6 +3380,7 @@ async def cluster_only(
         "rows": rows,
         "message": f"Clustered {len(geo)} calls into {int(days_msg)} days.",
         "project_id": project_id,
+        "meta": meta,
     })
 
 
