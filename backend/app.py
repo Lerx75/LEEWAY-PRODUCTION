@@ -1049,15 +1049,22 @@ def balanced_assign(
         hex_total = {}
         hex_center = {}
 
-    # Determine processing order: group by hex to accumulate penalty locally
-    if use_penalty:
+    # Determine processing order to reduce "bullseye" effect:
+    # Assign hard-to-place (farther) points first so outer rings don't get squeezed last.
+    try:
+        min_d = np.min(D_call_to_center, axis=1)
+        # hardness: combine nearest distance with a margin to the 2nd nearest (if available)
+        second_min = np.partition(D_call_to_center, 1, axis=1)[:, 1] if k > 1 else min_d
+        hardness = min_d + 0.25 * (second_min - min_d)
+        order_idx = np.argsort(-hardness).tolist()  # descending hardness
+    except Exception:
         order_idx = list(range(n))
+    # If using hex contiguity, keep locality grouping but still farthest-first within groups
+    if use_penalty and hex_ids is not None:
         try:
-            order_idx.sort(key=lambda i: (str(hex_ids[i]), float(np.min(D_call_to_center[i, :]))) )
+            order_idx.sort(key=lambda i: (str(hex_ids[i]), -float(min_d[i]) if 'min_d' in locals() else 0.0))
         except Exception:
             pass
-    else:
-        order_idx = range(n)
 
     for i in order_idx:
         chosen_j = -1
@@ -1075,18 +1082,25 @@ def balanced_assign(
                     tot = hex_total.get(h, 0)
                     own = hex_center.get((h, j), 0)
                     penalty = lam * max(0, tot - own)
-                cost = base + penalty
+                # small load bias to avoid overfilling early centers
+                load_bias = 1e-6 * cap[j]
+                cost = base + penalty + load_bias
                 if cost < best_cost:
                     best_cost = cost
                     chosen_j = j
         else:
-            # Original: choose nearest available
-            # Iterate by increasing distance
-            order = np.argsort(D_call_to_center[i, :])
-            for j in order:
-                if cap[j] < max_calls:
-                    chosen_j = j
-                    break
+            # Choose nearest available with a tiny load bias (still distance-led)
+            best_cost = float("inf")
+            best_j = -1
+            for j in np.argsort(D_call_to_center[i, :]):
+                if cap[j] >= max_calls:
+                    continue
+                base = float(D_call_to_center[i, j])
+                cost = base + 1e-6 * cap[j]
+                if cost < best_cost:
+                    best_cost = cost
+                    best_j = j
+            chosen_j = best_j
         if chosen_j == -1:
             # no capacity; leave for second pass
             continue
@@ -1120,7 +1134,17 @@ def balanced_assign(
                     best = j
             j = int(best if best is not None else int(np.argmin(cap)))
         else:
-            j = int(np.argmin(cap))
+            # Choose center by distance + tiny load bias rather than pure load
+            best = None
+            best_cost = float('inf')
+            for j in range(k):
+                base = float(D_call_to_center[i, j])
+                load_bias = 1e-6 * cap[j]
+                cost = base + load_bias
+                if cost < best_cost:
+                    best_cost = cost
+                    best = j
+            j = int(best if best is not None else int(np.argmin(cap)))
         assign[i] = j
         cap[j] += 1
         if use_penalty:
