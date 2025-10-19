@@ -416,6 +416,7 @@ CLUSTER_SA_MAX_N = int(os.getenv("CLUSTER_SA_MAX_N", "180"))
 CLUSTER_SA_ITERS = int(os.getenv("CLUSTER_SA_ITERS", "600"))
 CLUSTER_SA_INIT_TEMP = float(os.getenv("CLUSTER_SA_INIT_TEMP", "80"))
 CLUSTER_SA_COOLING = float(os.getenv("CLUSTER_SA_COOLING", "0.996"))
+CLUSTER_PRECLUSTER_OSRM_ALL = int(os.getenv("CLUSTER_PRECLUSTER_OSRM_ALL", "0"))
 CLUSTER_REFINE_ITERS = int(os.getenv("CLUSTER_REFINE_ITERS", "2"))
 CLUSTER_REFINE_IMPROVE_RATIO = float(os.getenv("CLUSTER_REFINE_IMPROVE_RATIO", "1.25"))
 
@@ -888,18 +889,27 @@ def _precluster_days_kmedoids(
     if max_calls <= 0:
         return [list(range(n))]
     k = max(1, int(math.ceil(n / max_calls)))
-    # Use haversine for k-medoids (fast, robust). Only compute OSRM to centers if enabled.
-    D_hav = _haversine_matrix_full(coords)
-    meds = k_medoids(D_hav, k, iters=15, random_state=42)
+    # Prefer full OSRM for medoid selection when feasible; fall back to haversine.
+    use_osrm_full = bool(int(CLUSTER_PRECLUSTER_OSRM_ALL)) or (n <= max(1, int(CLUSTER_OSRM_MAX_N)))
+    D_full: np.ndarray
+    if use_osrm_full:
+        try:
+            D_full = osrm_table_batch(coords)
+        except Exception:
+            D_full = _haversine_matrix_full(coords)
+    else:
+        D_full = _haversine_matrix_full(coords)
+
+    meds = k_medoids(D_full, k, iters=25, random_state=42)
     # Distances from every call to chosen centers
     if int(VRP_KMEDOIDS_OSRM_CENTERS) and n <= max(1, int(VRP_PRECLUSTER_OSRM_MAX_N)):
         try:
             centers = coords[np.array(meds, dtype=int)]
             D_to_centers = osrm_matrix_between(coords, centers)  # road distances to centers only (n x k)
         except Exception:
-            D_to_centers = D_hav[:, meds]
+            D_to_centers = D_full[:, meds]
     else:
-        D_to_centers = D_hav[:, meds]
+        D_to_centers = D_full[:, meds]
     min_calls = max(1, int(math.floor((min_ratio if min_ratio is not None else 0.0) * max_calls)))
     try:
         hex_ids = _hex_ids_for_coords(coords, H3_PLAN_RES)
@@ -3156,6 +3166,45 @@ async def cluster_only(
                         improve_ratio=float(CLUSTER_REFINE_IMPROVE_RATIO),
                         iters=int(CLUSTER_REFINE_ITERS)
                     )
+                except Exception:
+                    pass
+                # Optional per-day routing order pass (OR-Tools single route without window) to prefer locally connected sequences
+                try:
+                    if _HAS_ORTOOLS:
+                        all_pts = np.vstack([terr_coords, np.zeros((1,2))])  # depot placeholder overwritten per day
+                        for gi, g in enumerate(day_groups):
+                            if len(g) <= 2:
+                                continue
+                            sub = terr_coords[g]
+                            # Build durations matrix for this group + pseudo depot at centroid (for better chain)
+                            cy, cx = float(np.mean(sub[:,0])), float(np.mean(sub[:,1]))
+                            all_pts = np.vstack([sub, np.array([[cy, cx]])])
+                            dm = osrm_table_batch_duration(all_pts)
+                            depot_idx = len(sub)
+                            # TSP with single vehicle to get a good visiting order; ignore service
+                            manager = pywrapcp.RoutingIndexManager(len(sub)+1, 1, depot_idx)
+                            routing = pywrapcp.RoutingModel(manager)
+                            def time_cb(fi, ti):
+                                f = manager.IndexToNode(fi); t = manager.IndexToNode(ti)
+                                return int(max(0, dm[f, t]))
+                            transit = routing.RegisterTransitCallback(time_cb)
+                            routing.SetArcCostEvaluatorOfAllVehicles(transit)
+                            params = pywrapcp.DefaultRoutingSearchParameters()
+                            params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+                            params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+                            params.time_limit.seconds = 3
+                            sol = routing.SolveWithParameters(params)
+                            if sol:
+                                order: List[int] = []
+                                idx2 = routing.Start(0)
+                                while not routing.IsEnd(idx2):
+                                    node = manager.IndexToNode(idx2)
+                                    if node != depot_idx:
+                                        order.append(int(node))
+                                    idx2 = sol.Value(routing.NextVar(idx2))
+                                # reorder indices within the group to this route order (keeps membership unchanged)
+                                if len(order) == len(g):
+                                    day_groups[gi] = [g[i] for i in order]
                 except Exception:
                     pass
                 day_counter = 1
