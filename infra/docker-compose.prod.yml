@@ -26,6 +26,8 @@ services:
       dockerfile: Dockerfile
     env_file:
       - ./.env.prod
+      # Non-secret tuning flags for clustering/OSRM
+      - ./clustering.flags
     ports:
       - "8000:8000"
     depends_on:
@@ -43,6 +45,8 @@ services:
       dockerfile: Dockerfile.worker
     env_file:
       - ./.env.prod
+      # Non-secret tuning flags for clustering/OSRM
+      - ./clustering.flags
     depends_on:
       - redis
       - backend
