@@ -299,11 +299,8 @@ export default function AppMain() {
             const cand = headersNorm.find(h => /(days|weekday|open|availability)/.test(h.key));
             if (cand) setMapCallDays(cand.raw);
           }
-          const groupCand = (() => {
-            const groupPattern = /(territory|territories|territoryname|territoryid|territorycode|territorydescription|territorydesc|group|grouping|groupname|cluster|route|routename|team|teamname|teamid|teamcode|worker|workernumber|resource|resourcegroup|resourcename|engineer|rep|salesrep|salesperson|salespersonname|driver|technician|tech|agent|advisor|advocate|area|zone|region|district|division|market|branch|pod|crew|crewname|manager|accountmanager|owner|day|dayname|weekday|weekpart|cell|subteam)/;
-            return headersNorm.find(h => groupPattern.test(h.key));
-          })();
-          setMapGroupCol(groupCand ? groupCand.raw : '');
+          // Deprecated: do not auto-detect group/territory column anymore
+          setMapGroupCol('');
         } catch (err) {
           // ignore parse errors; mapping can be typed
         }
@@ -1237,17 +1234,7 @@ export default function AppMain() {
               <input type="file" onChange={handleFileChange} accept=".xlsx,.xls" style={{marginBottom: 12}} />
             </div>
           )}
-          {mode !== 'route' && callHeaders.length > 0 && (
-            <div className="card">
-              <label style={{display:'block', fontWeight:600, marginBottom:6}}>Existing Territory/Group Column (optional) <Help text="If your sheet already assigns calls to reps/territories, pick that column so we keep days separate per group." /></label>
-              <select value={mapGroupCol} onChange={e => setMapGroupCol(e.target.value)} style={{width:'100%'}}>
-                <option value="">None</option>
-                {callHeaders.map(h => (
-                  <option key={h} value={h}>{h}</option>
-                ))}
-              </select>
-            </div>
-          )}
+          {/* Removed deprecated territory/group selector for non-route modes */}
           {mode !== 'route' && (
             <>
               <div className="card">
@@ -1334,17 +1321,7 @@ export default function AppMain() {
           <input placeholder="Days (optional)" value={mapCallDays} onChange={e=>setMapCallDays(e.target.value)} style={{width:'100%'}} />
                     )}
                   </div>
-                  <div>
-                    <label style={{display:'block', fontSize:12, color:'#fff'}}>Group/Territory (optional)</label>
-                    {callHeaders.length ? (
-          <select value={mapGroupCol} onChange={e=>setMapGroupCol(e.target.value)} style={{width:'100%'}}>
-                        <option value="">None</option>
-                        {callHeaders.map(h => <option key={h} value={h}>{h}</option>)}
-                      </select>
-                    ) : (
-          <input placeholder="Group/Territory" value={mapGroupCol} onChange={e=>setMapGroupCol(e.target.value)} style={{width:'100%'}} />
-                    )}
-                  </div>
+                  {/* Removed deprecated Group/Territory column mapping */}
                 </div>
               </div>
               <div className="card" style={{display:'flex', flexDirection:'column', gap:12}}>

@@ -10,8 +10,8 @@ cd "$REPO_DIR"
 echo "[deploy] Ensuring docker network leeway-net exists"
 docker network create leeway-net || true
 
-if [ ! -f infra/.env.production ]; then
-  echo "[deploy][ERROR] Missing infra/.env.production"
+if [ ! -f infra/.env.prod ]; then
+  echo "[deploy][ERROR] Missing infra/.env.prod"
   exit 1
 fi
 

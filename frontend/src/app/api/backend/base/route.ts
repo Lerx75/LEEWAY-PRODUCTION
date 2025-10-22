@@ -1,5 +1,5 @@
-import { NextResponse } from 'next/server';
 import { resolveProjectUser } from '@/lib/project-backend';
+import { NextResponse } from 'next/server';
 
 // Minimal helper to resolve the backend base the frontend is configured to use
 const resolveBase = () => {

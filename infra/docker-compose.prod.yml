@@ -25,7 +25,7 @@ services:
       context: ../backend
       dockerfile: Dockerfile
     env_file:
-      - ./.env.production
+      - ./.env.prod
       # Non-secret tuning flags for clustering/OSRM
       - ./clustering.flags
     ports:
@@ -37,6 +37,10 @@ services:
       - leeway-data:/srv/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      # Limit Uvicorn workers/threads to prevent CPU thrash on small VPS
+      UVICORN_WORKERS: "1"
+      UVICORN_THREADS: "1"
 
   worker:
     container_name: leeway-worker
@@ -44,7 +48,7 @@ services:
       context: ../backend
       dockerfile: Dockerfile.worker
     env_file:
-      - ./.env.production
+      - ./.env.prod
       # Non-secret tuning flags for clustering/OSRM
       - ./clustering.flags
     depends_on:
@@ -55,6 +59,9 @@ services:
       - leeway-data:/srv/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      # Limit Celery worker concurrency to avoid oversubscription
+      CELERY_CONCURRENCY: "1"
 
   frontend:
     container_name: leeway-frontend
@@ -62,7 +69,11 @@ services:
       context: ../frontend
       dockerfile: Dockerfile
     env_file:
-      - ./.env.production
+      - ./.env.prod
+    environment:
+      # Ensure frontend talks directly to internal backend to avoid Cloudflare 524
+      PROJECT_BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_API_BASE: http://backend:8000
     ports:
       - "3000:3000"
     depends_on:

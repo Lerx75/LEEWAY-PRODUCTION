@@ -1,5 +1,5 @@
-import { NextResponse } from 'next/server';
 import { projectBackendFetch, resolveProjectUser } from '@/lib/project-backend';
+import { NextResponse } from 'next/server';
 
 export async function GET() {
   try {
