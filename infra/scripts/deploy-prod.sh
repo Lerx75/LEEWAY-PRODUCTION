@@ -11,8 +11,13 @@ echo "[deploy] Ensuring docker network leeway-net exists"
 docker network create leeway-net || true
 
 if [ ! -f infra/.env.prod ]; then
-  echo "[deploy][ERROR] Missing infra/.env.prod"
-  exit 1
+  if [ -f infra/.env.production ]; then
+    echo "[deploy][WARN] infra/.env.prod not found, but infra/.env.production exists. Copying as fallback."
+    cp infra/.env.production infra/.env.prod
+  else
+    echo "[deploy][ERROR] Missing infra/.env.prod (and no infra/.env.production to fallback)"
+    exit 1
+  fi
 fi
 
 echo "[deploy] Rebuilding backend, worker, frontend"
